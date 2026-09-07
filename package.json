@@ -50,7 +50,11 @@
     "pack:test": "node test/package/run.mjs",
     "quality": "npm run build && npm run typecheck && npm run lint && npm run test:coverage && npm run pack:test"
   },
+  "peerDependencies": {
+    "ethers": "^6.0.0"
+  },
   "devDependencies": {
+    "ethers": "^6.17.0",
     "typescript": "^7.0.2"
   }
 }
