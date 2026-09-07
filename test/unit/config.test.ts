@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { validateManagerConfig } from "../../src/pool/config.js";
+import {
+  normalizeManagerConfig,
+  validateManagerConfig,
+} from "../../src/pool/config.js";
 import type { RpcPoolManagerConfig } from "../../src/pool/types.js";
 
 const validConfig: RpcPoolManagerConfig = {
@@ -82,6 +85,64 @@ describe("validateManagerConfig", () => {
       validateManagerConfig(config);
     }).toThrow(
       new TypeError("networks[0].rpcUrls must not be empty"),
+    );
+  });
+});
+
+describe("normalizeManagerConfig", () => {
+  it("normalizes and deduplicates equivalent URLs in first-seen order", () => {
+    const config = withConfig({
+      networks: [
+        {
+          chainId: 1,
+          rpcUrls: [
+            "HTTP://FIRST.EXAMPLE:80",
+            "https://SECOND.example:443/rpc",
+            "http://first.example/",
+            "https://second.example/rpc",
+            "https://third.example?token=value#fragment",
+          ],
+        },
+      ],
+    });
+
+    const normalized = normalizeManagerConfig(config);
+
+    expect(normalized.networks[0]?.rpcUrls).toEqual([
+      "http://first.example/",
+      "https://second.example/rpc",
+      "https://third.example/?token=value#fragment",
+    ]);
+    expect(config.networks[0]?.rpcUrls).toHaveLength(5);
+  });
+
+  it.each(["ftp://rpc.example", "ws://rpc.example", "rpc.example", "/rpc"])(
+    "rejects unsupported RPC URL %s",
+    (rpcUrl) => {
+      const config = withConfig({
+        networks: [{ chainId: 1, rpcUrls: [rpcUrl] }],
+      });
+
+      expect(() => {
+        normalizeManagerConfig(config);
+      }).toThrow(TypeError);
+    },
+  );
+
+  it("reports the location of a malformed URL", () => {
+    const config = withConfig({
+      networks: [
+        { chainId: 1, rpcUrls: ["https://first.example"] },
+        { chainId: 2, rpcUrls: ["https://second.example", "not a URL"] },
+      ],
+    });
+
+    expect(() => {
+      normalizeManagerConfig(config);
+    }).toThrow(
+      new TypeError(
+        "networks[1].rpcUrls[1] must be a valid HTTP or HTTPS URL",
+      ),
     );
   });
 });

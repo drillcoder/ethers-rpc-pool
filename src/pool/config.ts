@@ -28,3 +28,42 @@ export function validateManagerConfig(config: RpcPoolManagerConfig): void {
     }
   }
 }
+
+function normalizeRpcUrl(value: string, path: string): string {
+  let url: URL;
+
+  try {
+    url = new URL(value);
+  } catch {
+    throw new TypeError(`${path} must be a valid HTTP or HTTPS URL`);
+  }
+
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new TypeError(`${path} must use the HTTP or HTTPS protocol`);
+  }
+
+  return url.href;
+}
+
+export function normalizeManagerConfig(config: RpcPoolManagerConfig): RpcPoolManagerConfig {
+  validateManagerConfig(config);
+
+  const networks = config.networks.map((network, networkIndex) => {
+    const rpcUrls = new Set<string>();
+
+    for (const [urlIndex, rpcUrl] of network.rpcUrls.entries()) {
+      const path = `networks[${String(networkIndex)}].rpcUrls[${String(urlIndex)}]`;
+      rpcUrls.add(normalizeRpcUrl(rpcUrl, path));
+    }
+
+    return Object.freeze({
+      chainId: network.chainId,
+      rpcUrls: Object.freeze([...rpcUrls]),
+    });
+  });
+
+  return Object.freeze({
+    ...config,
+    networks: Object.freeze(networks),
+  });
+}
