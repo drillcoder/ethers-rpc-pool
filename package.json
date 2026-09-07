@@ -2,6 +2,16 @@
   "name": "@drillcoder/ethers-rpc-pool",
   "version": "0.0.0-development",
   "description": "A resilient TypeScript JSON-RPC endpoint pool for ethers v6 and Node.js",
+  "keywords": [
+    "ethereum",
+    "ethers",
+    "json-rpc",
+    "rpc",
+    "failover",
+    "load-balancing",
+    "typescript"
+  ],
+  "author": "drillcoder",
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
@@ -18,5 +28,16 @@
   "engines": {
     "node": ">=22"
   },
-  "packageManager": "npm@10.9.8"
+  "packageManager": "npm@10.9.8",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/drillcoder/ethers-rpc-pool.git"
+  },
+  "bugs": {
+    "url": "https://github.com/drillcoder/ethers-rpc-pool/issues"
+  },
+  "homepage": "https://github.com/drillcoder/ethers-rpc-pool#readme",
+  "publishConfig": {
+    "access": "public"
+  }
 }
