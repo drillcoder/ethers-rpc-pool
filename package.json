@@ -54,10 +54,10 @@
     "ethers": "^6.0.0"
   },
   "devDependencies": {
-    "@eslint/js": "^10.0.1",
+    "@eslint/js": "^9.39.5",
     "@types/node": "^22.20.1",
     "@vitest/coverage-v8": "^5.0.0",
-    "eslint": "^10.10.0",
+    "eslint": "^9.39.5",
     "eslint-import-resolver-typescript": "^4.4.5",
     "eslint-plugin-import-x": "^4.17.1",
     "eslint-plugin-n": "^18.3.0",
