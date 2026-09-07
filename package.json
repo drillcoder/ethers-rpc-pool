@@ -39,5 +39,8 @@
   "homepage": "https://github.com/drillcoder/ethers-rpc-pool#readme",
   "publishConfig": {
     "access": "public"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
   }
 }
