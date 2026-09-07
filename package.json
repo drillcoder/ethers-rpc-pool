@@ -2,6 +2,7 @@
   "name": "@drillcoder/ethers-rpc-pool",
   "version": "0.0.0-development",
   "description": "A resilient TypeScript JSON-RPC endpoint pool for ethers v6 and Node.js",
+  "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
