@@ -1,0 +1,21 @@
+{
+  "name": "@drillcoder/ethers-rpc-pool",
+  "version": "0.0.0-development",
+  "description": "A resilient TypeScript JSON-RPC endpoint pool for ethers v6 and Node.js",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "npm@10.9.8"
+}
