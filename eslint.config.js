@@ -35,9 +35,7 @@ export default tseslint.config(
     files: typescriptFiles,
     languageOptions: {
       parserOptions: {
-        projectService: {
-          allowDefaultProject: ["vitest.config.ts"],
-        },
+        project: ["tsconfig.json", "test/tsconfig.json"],
         tsconfigRootDir: import.meta.dirname,
       },
     },
@@ -67,7 +65,17 @@ export default tseslint.config(
       "@typescript-eslint/no-floating-promises": "error",
       "@typescript-eslint/no-misused-promises": "error",
       "@typescript-eslint/no-shadow": "error",
-      "import-x/extensions": ["error", "always", { ignorePackages: true }],
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            {
+              message: "Relative ESM imports must use the .js extension.",
+              regex: "^\\.{1,2}/(?!.*\\.js$).*$",
+            },
+          ],
+        },
+      ],
       "no-param-reassign": "error",
       "no-shadow": "off",
     },
