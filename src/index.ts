@@ -1,3 +1,10 @@
+export {
+  NoUsableRpcEndpointError,
+  OperationTimeoutError,
+  RpcEndpointDataError,
+  RpcPoolClosedError,
+  UnknownNetworkError,
+} from "./errors/errors.js";
 export type {
   RetryableRpcClient,
   RpcExecutionOptions,
