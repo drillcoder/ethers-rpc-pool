@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+
 import { JsonRpcProvider } from "ethers";
 import type {
   JsonRpcPayload,
@@ -5,19 +7,41 @@ import type {
   Networkish,
 } from "ethers";
 
+import { createRuntime } from "../pool/runtime.js";
+import type { RuntimeDependencies } from "../pool/runtime.js";
+
 export type HttpRequest = (
   input: string,
   init: RequestInit,
 ) => Promise<Response>;
 
+export interface EndpointJsonRpcProviderOptions {
+  readonly requestTimeoutMs: number;
+  readonly request?: HttpRequest;
+  readonly runtime?: Partial<RuntimeDependencies>;
+}
+
+export class RpcRequestTimeoutError extends Error {
+  public override readonly name = "RpcRequestTimeoutError";
+  public readonly timeoutMs: number;
+
+  public constructor(timeoutMs: number) {
+    super(`RPC request timed out after ${String(timeoutMs)} ms`);
+    this.timeoutMs = timeoutMs;
+  }
+}
+
 export class EndpointJsonRpcProvider extends JsonRpcProvider {
+  readonly #deadline = new AsyncLocalStorage<number>();
   readonly #request: HttpRequest;
+  readonly #requestTimeoutMs: number;
+  readonly #runtime: RuntimeDependencies;
   readonly #url: string;
 
   public constructor(
     url: string,
     network: Networkish,
-    request: HttpRequest = globalThis.fetch,
+    options: EndpointJsonRpcProviderOptions,
   ) {
     super(url, network, {
       batchMaxCount: 1,
@@ -25,7 +49,13 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
     });
 
     this.#url = url;
-    this.#request = request;
+    this.#request = options.request ?? globalThis.fetch;
+    this.#requestTimeoutMs = options.requestTimeoutMs;
+    this.#runtime = createRuntime(options.runtime);
+  }
+
+  public runWithDeadline<Result>(deadlineMs: number, operation: () => Promise<Result>): Promise<Result> {
+    return this.#deadline.run(deadlineMs, operation);
   }
 
   public override async _send(payload: JsonRpcPayload | JsonRpcPayload[]): Promise<JsonRpcResult[]> {
@@ -37,14 +67,34 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
   }
 
   async #sendOne(payload: JsonRpcPayload): Promise<JsonRpcResult> {
-    const response = await this.#request(this.#url, {
-      body: JSON.stringify(payload),
-      headers: {
-        "content-type": "application/json",
-      },
-      method: "POST",
-    });
+    const deadlineMs = this.#deadline.getStore();
+    const remainingMs =
+      deadlineMs === undefined
+        ? Number.POSITIVE_INFINITY
+        : deadlineMs - this.#runtime.monotonicNow();
+    if (remainingMs <= 0) {
+      throw new RpcRequestTimeoutError(0);
+    }
 
-    return (await response.json()) as JsonRpcResult;
+    const timeoutMs = Math.min(this.#requestTimeoutMs, remainingMs);
+    const controller = new AbortController();
+    const timeout = this.#runtime.setTimeout(() => {
+      controller.abort(new RpcRequestTimeoutError(timeoutMs));
+    }, timeoutMs);
+
+    try {
+      const response = await this.#request(this.#url, {
+        body: JSON.stringify(payload),
+        headers: {
+          "content-type": "application/json",
+        },
+        method: "POST",
+        signal: controller.signal,
+      });
+
+      return (await response.json()) as JsonRpcResult;
+    } finally {
+      this.#runtime.clearTimeout(timeout);
+    }
   }
 }

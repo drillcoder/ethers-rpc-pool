@@ -1,8 +1,15 @@
 import { JsonRpcProvider } from "ethers";
 import { describe, expect, it, vi } from "vitest";
 
-import { EndpointJsonRpcProvider } from "../../src/transport/provider.js";
+import {
+  EndpointJsonRpcProvider,
+  RpcRequestTimeoutError,
+} from "../../src/transport/provider.js";
 import type { HttpRequest } from "../../src/transport/provider.js";
+import type {
+  RuntimeDependencies,
+  TimerHandle,
+} from "../../src/pool/runtime.js";
 
 const rpcUrl = "https://rpc.example/";
 
@@ -10,12 +17,38 @@ function jsonResponse(result: unknown, id: number): Response {
   return Response.json({ id, jsonrpc: "2.0", result });
 }
 
+function providerOptions(request: HttpRequest) {
+  return {
+    request,
+    requestTimeoutMs: 1_000,
+  };
+}
+
 describe("EndpointJsonRpcProvider", () => {
+  it("uses the environment fetch implementation by default", async () => {
+    const request = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse("0x2a", 1));
+    const provider = new EndpointJsonRpcProvider(rpcUrl, 1, {
+      requestTimeoutMs: 1_000,
+    });
+
+    await expect(provider.getBlockNumber()).resolves.toBe(42);
+    expect(request).toHaveBeenCalledOnce();
+
+    provider.destroy();
+    request.mockRestore();
+  });
+
   it("is ethers-compatible and sends one client call as one HTTP request", async () => {
     const request = vi.fn<HttpRequest>(() =>
       Promise.resolve(jsonResponse("0x2a", 1)),
     );
-    const provider = new EndpointJsonRpcProvider(rpcUrl, 1, request);
+    const provider = new EndpointJsonRpcProvider(
+      rpcUrl,
+      1,
+      providerOptions(request),
+    );
 
     await expect(provider.getBlockNumber()).resolves.toBe(42);
 
@@ -37,7 +70,11 @@ describe("EndpointJsonRpcProvider", () => {
       .fn<HttpRequest>()
       .mockResolvedValueOnce(jsonResponse("0x1", 1))
       .mockResolvedValueOnce(jsonResponse("0x2", 2));
-    const provider = new EndpointJsonRpcProvider(rpcUrl, 1, request);
+    const provider = new EndpointJsonRpcProvider(
+      rpcUrl,
+      1,
+      providerOptions(request),
+    );
 
     await expect(
       provider._send([
@@ -60,7 +97,11 @@ describe("EndpointJsonRpcProvider", () => {
   it("does not retry a failed HTTP request", async () => {
     const failure = new Error("connection lost");
     const request = vi.fn<HttpRequest>().mockRejectedValueOnce(failure);
-    const provider = new EndpointJsonRpcProvider(rpcUrl, 1, request);
+    const provider = new EndpointJsonRpcProvider(
+      rpcUrl,
+      1,
+      providerOptions(request),
+    );
 
     await expect(
       provider._send({
@@ -71,6 +112,131 @@ describe("EndpointJsonRpcProvider", () => {
       }),
     ).rejects.toBe(failure);
     expect(request).toHaveBeenCalledOnce();
+
+    provider.destroy();
+  });
+
+  it("uses the smaller remaining operation budget as the request timeout", async () => {
+    const timerHandle = {} as TimerHandle;
+    const setTimeout = vi.fn(() => timerHandle);
+    const clearTimeout = vi.fn();
+    const runtime: Partial<RuntimeDependencies> = {
+      clearTimeout,
+      monotonicNow: () => 750,
+      setTimeout,
+    };
+    const request = vi.fn<HttpRequest>(() =>
+      Promise.resolve(jsonResponse("0x2a", 1)),
+    );
+    const provider = new EndpointJsonRpcProvider(rpcUrl, 1, {
+      request,
+      requestTimeoutMs: 1_000,
+      runtime,
+    });
+
+    await expect(
+      provider.runWithDeadline(1_000, async () => await provider.getBlockNumber()),
+    ).resolves.toBe(42);
+
+    expect(setTimeout).toHaveBeenCalledWith(expect.any(Function), 250);
+    expect(clearTimeout).toHaveBeenCalledWith(timerHandle);
+    expect(request.mock.calls[0]?.[1].signal).toBeInstanceOf(AbortSignal);
+
+    provider.destroy();
+  });
+
+  it("uses requestTimeoutMs when the operation has more time remaining", async () => {
+    const setTimeout = vi.fn(globalThis.setTimeout);
+    const clearTimeout = vi.fn(globalThis.clearTimeout);
+    const request = vi.fn<HttpRequest>(() =>
+      Promise.resolve(jsonResponse("0x2a", 1)),
+    );
+    const provider = new EndpointJsonRpcProvider(rpcUrl, 1, {
+      request,
+      requestTimeoutMs: 100,
+      runtime: {
+        clearTimeout,
+        monotonicNow: () => 0,
+        setTimeout,
+      },
+    });
+
+    await expect(
+      provider.runWithDeadline(1_000, async () => await provider.getBlockNumber()),
+    ).resolves.toBe(42);
+
+    expect(setTimeout).toHaveBeenCalledWith(expect.any(Function), 100);
+    expect(clearTimeout).toHaveBeenCalledOnce();
+
+    provider.destroy();
+  });
+
+  it("refuses to start a request after the operation deadline", async () => {
+    const request = vi.fn<HttpRequest>();
+    const provider = new EndpointJsonRpcProvider(rpcUrl, 1, {
+      request,
+      requestTimeoutMs: 1_000,
+      runtime: {
+        monotonicNow: () => 1_000,
+      },
+    });
+
+    await expect(
+      provider.runWithDeadline(
+        1_000,
+        async () =>
+          await provider._send({
+            id: 1,
+            jsonrpc: "2.0",
+            method: "eth_blockNumber",
+            params: [],
+          }),
+      ),
+    ).rejects.toEqual(new RpcRequestTimeoutError(0));
+    expect(request).not.toHaveBeenCalled();
+
+    provider.destroy();
+  });
+
+  it("aborts a pending request when its timeout expires", async () => {
+    let fireTimeout = (): void => undefined;
+    const timerHandle = {} as TimerHandle;
+    const request = vi.fn<HttpRequest>(
+      (_input, init) =>
+        new Promise((_resolve, reject) => {
+          init.signal?.addEventListener("abort", () => {
+            reject(init.signal?.reason as Error);
+          });
+        }),
+    );
+    const clearTimeout = vi.fn();
+    const provider = new EndpointJsonRpcProvider(rpcUrl, 1, {
+      request,
+      requestTimeoutMs: 100,
+      runtime: {
+        clearTimeout,
+        monotonicNow: () => 0,
+        setTimeout: (callback) => {
+          fireTimeout = callback;
+          return timerHandle;
+        },
+      },
+    });
+
+    const result = provider._send({
+      id: 1,
+      jsonrpc: "2.0",
+      method: "eth_blockNumber",
+      params: [],
+    });
+    fireTimeout();
+
+    await expect(result).rejects.toEqual(new RpcRequestTimeoutError(100));
+    expect(request.mock.calls[0]?.[1].signal?.aborted).toBe(true);
+    expect(request.mock.calls[0]?.[1].signal?.reason).toEqual(
+      new RpcRequestTimeoutError(100),
+    );
+    expect(clearTimeout).toHaveBeenCalledWith(timerHandle);
 
     provider.destroy();
   });
