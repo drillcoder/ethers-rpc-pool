@@ -36,6 +36,14 @@ const authorizationPattern = /\b(?:access denied|authentication required|forbidd
 const contractExecutionPattern = /\b(?:execution reverted|revert)\b/iu;
 const authorizationCodes = new Set([401, 403]);
 
+export const jsonRpcLimitSignatures = Object.freeze({
+  quotaLimitCodes: Object.freeze([402]),
+  quotaLimitPattern:
+    /\b(?:(?:compute units?|credits?|quota) exhausted|monthly capacity limit exceeded|quota exceeded)\b/iu,
+  rateLimitCodes: Object.freeze([-32_005, 429]),
+  rateLimitPattern: /\b(?:rate limit(?:ed| exceeded| reached)?|too many requests)\b/iu,
+});
+
 function cooldown(
   category: RpcErrorCategory,
   policy: typeof shortCooldown | typeof longCooldown,
@@ -77,6 +85,20 @@ function classifyJsonRpcError(
   if (authorizationCodes.has(error.code) || authorizationPattern.test(message)) {
     return exclude("authorization", httpStatus);
   }
+
+    if (
+        jsonRpcLimitSignatures.quotaLimitCodes.includes(error.code) ||
+        jsonRpcLimitSignatures.quotaLimitPattern.test(message)
+    ) {
+        return cooldown("quota-limit", longCooldown, httpStatus);
+    }
+
+    if (
+        jsonRpcLimitSignatures.rateLimitCodes.includes(error.code) ||
+        jsonRpcLimitSignatures.rateLimitPattern.test(message)
+    ) {
+        return cooldown("rate-limit", longCooldown, httpStatus);
+    }
 
   switch (error.code) {
     case -32_602:
