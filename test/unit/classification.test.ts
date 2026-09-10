@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   classifyRpcTransportError,
   jsonRpcLimitSignatures,
+  parseRetryAfter,
 } from "../../src/transport/classification.js";
 import { RpcRequestTimeoutError, RpcTransportResponseError } from "../../src/transport/provider.js";
 import type { RpcErrorCategory } from "../../src/observability/types.js";
@@ -160,5 +161,73 @@ describe("classifyRpcTransportError", () => {
     expect(Object.isFrozen(jsonRpcLimitSignatures)).toBe(true);
     expect(Object.isFrozen(jsonRpcLimitSignatures.rateLimitCodes)).toBe(true);
     expect(Object.isFrozen(jsonRpcLimitSignatures.quotaLimitCodes)).toBe(true);
+  });
+});
+
+describe("parseRetryAfter", () => {
+  const nowMs = Date.parse("2026-01-01T00:00:00.000Z");
+
+  it.each([
+    ["30", 30_000],
+    [" 1.5 ", 1_500],
+    ["0", 0],
+    ["600", 600_000],
+  ])("parses numeric seconds %s", (value, expected) => {
+    expect(parseRetryAfter(value, nowMs)).toBe(expected);
+  });
+
+  it("parses an HTTP-date relative to the current epoch time", () => {
+    expect(parseRetryAfter("Thu, 01 Jan 2026 00:01:00 GMT", nowMs)).toBe(60_000);
+  });
+
+  it("clamps a past HTTP-date to zero", () => {
+    expect(parseRetryAfter("Wed, 31 Dec 2025 23:59:00 GMT", nowMs)).toBe(0);
+  });
+
+  it.each([undefined, "", "-1", "not-a-date", "1e309"])("rejects invalid value %s", (value) => {
+    expect(parseRetryAfter(value, nowMs)).toBeNull();
+  });
+
+  it("keeps a Retry-After value above the cooldown policy maximum", () => {
+    const error = new RpcTransportResponseError(429, { "retry-after": "600" }, undefined);
+
+    expect(classifyRpcTransportError(error, nowMs)).toEqual({
+      action: "cooldown",
+      baseDelayMs: 30_000,
+      category: "rate-limit",
+      httpStatus: 429,
+      maxDelayMs: 300_000,
+      retryAfterMs: 600_000,
+      retryable: true,
+    });
+  });
+
+  it("passes an HTTP-date delay through JSON-RPC quota classification", () => {
+    const error = new RpcTransportResponseError(
+      200,
+      { "retry-after": "Thu, 01 Jan 2026 00:01:00 GMT" },
+      { code: 402, message: "quota exceeded" },
+    );
+
+    expect(classifyRpcTransportError(error, nowMs)).toEqual({
+      action: "cooldown",
+      baseDelayMs: 30_000,
+      category: "quota-limit",
+      httpStatus: 200,
+      maxDelayMs: 300_000,
+      retryAfterMs: 60_000,
+      retryable: true,
+    });
+  });
+
+  it("ignores Retry-After for permanent authorization exclusion", () => {
+    const error = new RpcTransportResponseError(401, { "retry-after": "600" }, undefined);
+
+    expect(classifyRpcTransportError(error, nowMs)).toEqual({
+      action: "exclude",
+      category: "authorization",
+      httpStatus: 401,
+      retryable: true,
+    });
   });
 });
