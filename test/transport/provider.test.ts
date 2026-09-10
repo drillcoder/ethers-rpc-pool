@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   EndpointJsonRpcProvider,
   RpcRequestTimeoutError,
+  RpcTransportResponseError,
 } from "../../src/transport/provider.js";
 import type { HttpRequest } from "../../src/transport/provider.js";
 import type {
@@ -112,6 +113,143 @@ describe("EndpointJsonRpcProvider", () => {
       }),
     ).rejects.toBe(failure);
     expect(request).toHaveBeenCalledOnce();
+
+    provider.destroy();
+  });
+
+  it("preserves HTTP status and headers before ethers handles the response", async () => {
+    const request = vi.fn<HttpRequest>(() =>
+      Promise.resolve(
+        Response.json(
+          { id: 1, jsonrpc: "2.0", result: "accepted" },
+          {
+            headers: {
+              "retry-after": "30",
+              "x-request-id": "request-1",
+            },
+            status: 429,
+          },
+        ),
+      ),
+    );
+    const provider = new EndpointJsonRpcProvider(
+      rpcUrl,
+      1,
+      providerOptions(request),
+    );
+
+    await expect(
+      provider._send({
+        id: 1,
+        jsonrpc: "2.0",
+        method: "eth_blockNumber",
+        params: [],
+      }),
+    ).rejects.toMatchObject({
+      headers: {
+        "retry-after": "30",
+        "x-request-id": "request-1",
+      },
+      jsonRpcError: undefined,
+      status: 429,
+    });
+
+    const error = await provider
+      ._send({
+        id: 2,
+        jsonrpc: "2.0",
+        method: "eth_blockNumber",
+        params: [],
+      })
+      .catch((reason: unknown) => reason);
+    expect(error).toBeInstanceOf(RpcTransportResponseError);
+    expect(
+      Object.isFrozen((error as RpcTransportResponseError).headers),
+    ).toBe(true);
+
+    provider.destroy();
+  });
+
+  it("preserves JSON-RPC error fields from a successful HTTP response", async () => {
+    const rpcError = {
+      code: -32_000,
+      data: { retryAfter: 15 },
+      message: "rate limit exceeded",
+    };
+    const request = vi.fn<HttpRequest>(() =>
+      Promise.resolve(
+        Response.json({
+          error: rpcError,
+          id: 1,
+          jsonrpc: "2.0",
+        }),
+      ),
+    );
+    const provider = new EndpointJsonRpcProvider(
+      rpcUrl,
+      1,
+      providerOptions(request),
+    );
+
+    await expect(
+      provider._send({
+        id: 1,
+        jsonrpc: "2.0",
+        method: "eth_blockNumber",
+        params: [],
+      }),
+    ).rejects.toMatchObject({
+      jsonRpcError: rpcError,
+      status: 200,
+    });
+
+    const error = await provider
+      ._send({
+        id: 2,
+        jsonrpc: "2.0",
+        method: "eth_blockNumber",
+        params: [],
+      })
+      .catch((reason: unknown) => reason);
+    expect(
+      Object.isFrozen((error as RpcTransportResponseError).jsonRpcError),
+    ).toBe(true);
+
+    provider.destroy();
+  });
+
+  it("retains HTTP metadata when the response body is not JSON", async () => {
+    const request = vi.fn<HttpRequest>(() =>
+      Promise.resolve(
+        new Response("temporarily unavailable", {
+          headers: { "retry-after": "5" },
+          status: 503,
+        }),
+      ),
+    );
+    const provider = new EndpointJsonRpcProvider(
+      rpcUrl,
+      1,
+      providerOptions(request),
+    );
+
+    const result = await provider
+      ._send({
+        id: 1,
+        jsonrpc: "2.0",
+        method: "eth_blockNumber",
+        params: [],
+      })
+      .catch((reason: unknown) => reason);
+
+    expect(result).toMatchObject({
+      headers: { "retry-after": "5" },
+      jsonRpcError: undefined,
+      status: 503,
+    });
+    expect((result as RpcTransportResponseError).cause).toBeInstanceOf(
+      SyntaxError,
+    );
 
     provider.destroy();
   });

@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 
 import { JsonRpcProvider } from "ethers";
 import type {
+  JsonRpcError,
   JsonRpcPayload,
   JsonRpcResult,
   Networkish,
@@ -19,6 +20,25 @@ export interface EndpointJsonRpcProviderOptions {
   readonly requestTimeoutMs: number;
   readonly request?: HttpRequest;
   readonly runtime?: Partial<RuntimeDependencies>;
+}
+
+export class RpcTransportResponseError extends Error {
+  public override readonly name = "RpcTransportResponseError";
+  public readonly headers: Readonly<Record<string, string>>;
+  public readonly jsonRpcError: Readonly<JsonRpcError["error"]> | undefined;
+  public readonly status: number;
+
+  public constructor(
+    status: number,
+    headers: Readonly<Record<string, string>>,
+    jsonRpcError: Readonly<JsonRpcError["error"]> | undefined,
+    options?: ErrorOptions,
+  ) {
+    super("RPC transport received an error response", options);
+    this.status = status;
+    this.headers = headers;
+    this.jsonRpcError = jsonRpcError;
+  }
 }
 
 export class RpcRequestTimeoutError extends Error {
@@ -91,8 +111,34 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
         method: "POST",
         signal: controller.signal,
       });
+      const headers = Object.freeze(
+        Object.fromEntries(response.headers.entries()),
+      );
+      let body: unknown;
 
-      return (await response.json()) as JsonRpcResult;
+      try {
+        body = await response.json();
+      } catch (cause) {
+        throw new RpcTransportResponseError(
+          response.status,
+          headers,
+          undefined,
+          { cause },
+        );
+      }
+
+      const jsonRpcError = (body as Partial<JsonRpcError>).error;
+      if (!response.ok || jsonRpcError !== undefined) {
+        throw new RpcTransportResponseError(
+          response.status,
+          headers,
+          jsonRpcError === undefined
+            ? undefined
+            : Object.freeze({ ...jsonRpcError }),
+        );
+      }
+
+      return body as JsonRpcResult;
     } finally {
       this.#runtime.clearTimeout(timeout);
     }
