@@ -26,23 +26,24 @@ export interface EndpointState {
     version: number;
 }
 
-export interface NetworkState {
+export interface NetworkState<Endpoint extends EndpointState = EndpointState> {
     readonly chainId: number;
-    readonly endpoints: readonly EndpointState[];
+    readonly endpoints: readonly Endpoint[];
     activeGroups: number;
     selectionCursor: number;
 }
 
-export interface PoolState {
-    readonly networks: ReadonlyMap<number, NetworkState>;
+export interface PoolState<Endpoint extends EndpointState = EndpointState> {
+    readonly networks: ReadonlyMap<number, NetworkState<Endpoint>>;
 }
 
-export interface EndpointCandidate {
-    readonly endpoint: EndpointState;
+export interface EndpointCandidate<Endpoint extends EndpointState = EndpointState> {
+    readonly endpoint: Endpoint;
     readonly requiresProbe: boolean;
 }
 
-export interface EndpointReservation extends EndpointCandidate {
+export interface EndpointReservation<Endpoint extends EndpointState = EndpointState>
+    extends EndpointCandidate<Endpoint> {
     readonly probeToken: EndpointProbeToken | null;
     readonly version: number;
 }
@@ -90,7 +91,10 @@ export function createPoolState(networks: readonly RpcNetworkConfig[]): PoolStat
     };
 }
 
-function selectRoundRobin(network: NetworkState, candidates: readonly EndpointCandidate[]): EndpointCandidate {
+function selectRoundRobin<Endpoint extends EndpointState>(
+    network: NetworkState<Endpoint>,
+    candidates: readonly EndpointCandidate<Endpoint>[],
+): EndpointCandidate<Endpoint> {
     const endpointCount = network.endpoints.length;
     const cursor = network.selectionCursor;
     return candidates.reduce((current, candidate) => {
@@ -100,8 +104,11 @@ function selectRoundRobin(network: NetworkState, candidates: readonly EndpointCa
     });
 }
 
-export function getEndpointCandidates(network: NetworkState, nowMs: number): readonly EndpointCandidate[] {
-    return network.endpoints.flatMap<EndpointCandidate>((endpoint) => {
+export function getEndpointCandidates<Endpoint extends EndpointState>(
+    network: NetworkState<Endpoint>,
+    nowMs: number,
+): readonly EndpointCandidate<Endpoint>[] {
+    return network.endpoints.flatMap<EndpointCandidate<Endpoint>>((endpoint) => {
         if (endpoint.status === "available") {
             return [{ endpoint, requiresProbe: false }];
         }
@@ -114,10 +121,10 @@ export function getEndpointCandidates(network: NetworkState, nowMs: number): rea
     });
 }
 
-export function selectEndpointCandidate(
-    network: NetworkState,
-    candidates: readonly EndpointCandidate[],
-): EndpointCandidate | null {
+export function selectEndpointCandidate<Endpoint extends EndpointState>(
+    network: NetworkState<Endpoint>,
+    candidates: readonly EndpointCandidate<Endpoint>[],
+): EndpointCandidate<Endpoint> | null {
     if (candidates.length === 0) {
         return null;
     }
@@ -127,7 +134,9 @@ export function selectEndpointCandidate(
     let preferred = leastActive.filter(({ endpoint }) => endpoint.latencyEwmaMs === null);
 
     if (preferred.length === 0) {
-        const measured = leastActive as readonly (EndpointCandidate & { endpoint: { latencyEwmaMs: number } })[];
+        const measured = leastActive as readonly (EndpointCandidate<Endpoint> & {
+            endpoint: { latencyEwmaMs: number };
+        })[];
         const minimumLatency = Math.min(...measured.map(({ endpoint }) => endpoint.latencyEwmaMs));
         preferred = leastActive.filter(({ endpoint }) => endpoint.latencyEwmaMs === minimumLatency);
     }
@@ -135,7 +144,10 @@ export function selectEndpointCandidate(
     return selectRoundRobin(network, preferred);
 }
 
-export function reserveEndpoint(network: NetworkState, nowMs: number): EndpointReservation | null {
+export function reserveEndpoint<Endpoint extends EndpointState>(
+    network: NetworkState<Endpoint>,
+    nowMs: number,
+): EndpointReservation<Endpoint> | null {
     const selected = selectEndpointCandidate(network, getEndpointCandidates(network, nowMs));
     if (selected === null) {
         return null;

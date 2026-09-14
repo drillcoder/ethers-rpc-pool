@@ -36,6 +36,7 @@ type RuntimeExportName =
     | "OperationTimeoutError"
     | "RpcEndpointDataError"
     | "RpcPoolClosedError"
+    | "RpcPoolManager"
     | "UnknownNetworkError";
 
 type TypeOnlyExportName =
