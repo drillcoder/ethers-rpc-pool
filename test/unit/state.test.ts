@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { createPoolState, reserveEndpoint } from "../../src/pool/state.js";
+import { createPoolState, reserveEndpoint, runMeasuredEndpointCall } from "../../src/pool/state.js";
 import type { NetworkState } from "../../src/pool/state.js";
 
 const networks = [
@@ -151,5 +151,44 @@ describe("reserveEndpoint", () => {
 
         expect(reserveEndpoint(network)).toBeNull();
         expect(network.activeGroups).toBe(0);
+    });
+});
+
+describe("runMeasuredEndpointCall", () => {
+    it("uses the first monotonic duration as the initial EWMA and smooths later samples", async () => {
+        const network = createNetwork();
+        const endpoint = network.endpoints[0];
+        const times = [10, 110, 200, 400];
+
+        if (endpoint === undefined) {
+            throw new Error("Expected test endpoint");
+        }
+
+        const runtime = { monotonicNow: () => times.shift() ?? 0 };
+
+        await expect(runMeasuredEndpointCall(endpoint, runtime, () => Promise.resolve("first"))).resolves.toBe("first");
+        expect(endpoint.latencyEwmaMs).toBe(100);
+
+        const secondCall = runMeasuredEndpointCall(endpoint, runtime, () => Promise.resolve("second"));
+        await expect(secondCall).resolves.toBe("second");
+        expect(endpoint.latencyEwmaMs).toBe(120);
+    });
+
+    it("records the duration of a rejected transport call", async () => {
+        const network = createNetwork();
+        const endpoint = network.endpoints[0];
+        const times = [50, 125];
+        const error = new Error("transport failed");
+
+        if (endpoint === undefined) {
+            throw new Error("Expected test endpoint");
+        }
+
+        await expect(runMeasuredEndpointCall(
+            endpoint,
+            { monotonicNow: () => times.shift() ?? 0 },
+            async () => await Promise.reject(error),
+        )).rejects.toBe(error);
+        expect(endpoint.latencyEwmaMs).toBe(75);
     });
 });

@@ -1,5 +1,8 @@
 import type { RpcEndpointExcludedReason, RpcEndpointStatus } from "../observability/types.js";
+import type { RuntimeDependencies } from "./runtime.js";
 import type { RpcNetworkConfig } from "./types.js";
+
+const latencyEwmaWeight = 0.2;
 
 export interface EndpointFailureStreaks {
     long: number;
@@ -99,4 +102,25 @@ export function reserveEndpoint(network: NetworkState): EndpointState | null {
     selected.activeGroups += 1;
     network.activeGroups += 1;
     return selected;
+}
+
+export function updateEndpointLatency(endpoint: EndpointState, sampleMs: number): void {
+    const previous = endpoint.latencyEwmaMs;
+    endpoint.latencyEwmaMs = previous === null
+        ? sampleMs
+        : latencyEwmaWeight * sampleMs + (1 - latencyEwmaWeight) * previous;
+}
+
+export async function runMeasuredEndpointCall<Result>(
+    endpoint: EndpointState,
+    runtime: Pick<RuntimeDependencies, "monotonicNow">,
+    operation: () => Promise<Result>,
+): Promise<Result> {
+    const startedAt = runtime.monotonicNow();
+
+    try {
+        return await operation();
+    } finally {
+        updateEndpointLatency(endpoint, runtime.monotonicNow() - startedAt);
+    }
 }
