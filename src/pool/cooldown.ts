@@ -23,6 +23,10 @@ function applyCooldown(
     policy: CooldownPolicy,
     retryAfterMs: number | null,
 ): number {
+    if (endpoint.status === "excluded") {
+        return endpoint.cooldownUntil ?? nowMs;
+    }
+
     endpoint.failureStreaks[policy.streak] += 1;
 
     const exponentialDelayMs = policy.baseDelayMs * 2 ** (endpoint.failureStreaks[policy.streak] - 1);
@@ -31,9 +35,10 @@ function applyCooldown(
     const cooldownDelayMs = baseDelayMs * (1 + maximumJitterRatio * runtime.random());
     const cooldownUntil = nowMs + cooldownDelayMs;
 
-    endpoint.cooldownUntil = cooldownUntil;
+    endpoint.cooldownUntil = Math.max(endpoint.cooldownUntil ?? 0, cooldownUntil);
     endpoint.status = "cooling-down";
-    return cooldownUntil;
+    endpoint.version += 1;
+    return endpoint.cooldownUntil;
 }
 
 export function applyShortCooldown(
@@ -58,16 +63,26 @@ export function applyEndpointDataCooldown(
     nowMs: number,
     runtime: Pick<RuntimeDependencies, "random">,
 ): number {
+    if (endpoint.status === "excluded") {
+        return endpoint.cooldownUntil ?? nowMs;
+    }
+
     const cooldownDelayMs = shortBaseDelayMs * (1 + maximumJitterRatio * runtime.random());
     const cooldownUntil = nowMs + cooldownDelayMs;
 
-    endpoint.cooldownUntil = cooldownUntil;
+    endpoint.cooldownUntil = Math.max(endpoint.cooldownUntil ?? 0, cooldownUntil);
     endpoint.status = "cooling-down";
-    return cooldownUntil;
+    endpoint.version += 1;
+    return endpoint.cooldownUntil;
 }
 
 export function excludeEndpointForAuthorization(endpoint: EndpointState): void {
+    if (endpoint.status === "excluded") {
+        return;
+    }
+
     endpoint.cooldownUntil = null;
     endpoint.excludedReason = "authorization";
     endpoint.status = "excluded";
+    endpoint.version += 1;
 }

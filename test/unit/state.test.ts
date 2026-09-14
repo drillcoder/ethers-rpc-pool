@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { applyShortCooldown } from "../../src/pool/cooldown.js";
+import { applyShortCooldown, excludeEndpointForAuthorization } from "../../src/pool/cooldown.js";
 import {
     createPoolState,
     getEndpointCandidates,
@@ -9,7 +9,7 @@ import {
     runMeasuredEndpointCall,
     selectEndpointCandidate,
 } from "../../src/pool/state.js";
-import type { NetworkState } from "../../src/pool/state.js";
+import type { EndpointReservation, EndpointState, NetworkState } from "../../src/pool/state.js";
 
 const networks = [
     { chainId: 1, rpcUrls: ["https://first.example/", "https://second.example/"] },
@@ -90,6 +90,31 @@ function createNetwork(): NetworkState {
     }
 
     return network;
+}
+
+function reserveExpiredProbe(): {
+    readonly endpoint: EndpointState;
+    readonly network: NetworkState;
+    readonly reservation: EndpointReservation;
+} {
+    const network = createNetwork();
+    const endpoint = network.endpoints[0];
+    const sibling = network.endpoints[1];
+
+    if (endpoint === undefined || sibling === undefined) {
+        throw new Error("Expected test endpoints");
+    }
+
+    endpoint.status = "cooling-down";
+    endpoint.cooldownUntil = 100;
+    sibling.status = "excluded";
+
+    const reservation = reserveEndpoint(network, 100);
+    if (reservation === null) {
+        throw new Error("Expected probe reservation");
+    }
+
+    return { endpoint, network, reservation };
 }
 
 describe("reserveEndpoint", () => {
@@ -320,6 +345,52 @@ describe("candidate inspection and reservation", () => {
         expect(endpoint.probeToken).toBeNull();
         expect(endpoint.activeGroups).toBe(0);
         expect(network.activeGroups).toBe(0);
+    });
+
+    it("does not let a late probe success erase a newer cooldown", async () => {
+        const { endpoint, network, reservation } = reserveExpiredProbe();
+
+        applyShortCooldown(endpoint, 200, { random: () => 0 });
+        await runEndpointReservation(network, reservation, () => Promise.resolve(), () => undefined);
+
+        expect(endpoint.status).toBe("cooling-down");
+        expect(endpoint.cooldownUntil).toBe(5_200);
+        expect(endpoint.failureStreaks.short).toBe(1);
+        expect(endpoint.probeToken).toBeNull();
+    });
+
+    it("does not let a late probe success reverse permanent exclusion", async () => {
+        const { endpoint, network, reservation } = reserveExpiredProbe();
+
+        excludeEndpointForAuthorization(endpoint);
+        await runEndpointReservation(network, reservation, () => Promise.resolve(), () => undefined);
+
+        expect(endpoint.status).toBe("excluded");
+        expect(endpoint.excludedReason).toBe("authorization");
+        expect(endpoint.cooldownUntil).toBeNull();
+        expect(endpoint.probeToken).toBeNull();
+    });
+
+    it("does not clear or recover a probe slot owned by another token", async () => {
+        const { endpoint, network, reservation } = reserveExpiredProbe();
+        const replacementToken = Symbol("replacement-probe");
+
+        endpoint.probeToken = replacementToken;
+        await runEndpointReservation(network, reservation, () => Promise.resolve(), () => undefined);
+
+        expect(endpoint.status).toBe("probe");
+        expect(endpoint.cooldownUntil).toBe(100);
+        expect(endpoint.probeToken).toBe(replacementToken);
+    });
+
+    it("does not recover an endpoint that became excluded without changing the reservation version", async () => {
+        const { endpoint, network, reservation } = reserveExpiredProbe();
+
+        endpoint.status = "excluded";
+        await runEndpointReservation(network, reservation, () => Promise.resolve(), () => undefined);
+
+        expect(endpoint.status).toBe("excluded");
+        expect(endpoint.probeToken).toBeNull();
     });
 });
 

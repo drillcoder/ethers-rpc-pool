@@ -46,6 +46,14 @@ describe("applyShortCooldown", () => {
         expect(endpoint.failureStreaks.short).toBe(6);
         expect(endpoint.failureStreaks.long).toBe(0);
     });
+
+    it("never shortens a newer cooldown and increments the endpoint version", () => {
+        const endpoint = createEndpoint();
+
+        endpoint.cooldownUntil = 20_000;
+        expect(applyShortCooldown(endpoint, 1_000, { random: () => 0 })).toBe(20_000);
+        expect(endpoint.version).toBe(1);
+    });
 });
 
 describe("applyLongCooldown", () => {
@@ -93,5 +101,27 @@ describe("authorization and endpoint-data failures", () => {
         expect(endpoint.status).toBe("cooling-down");
         expect(endpoint.cooldownUntil).toBe(16_000);
         expect(endpoint.failureStreaks).toEqual({ long: 0, short: 0 });
+        expect(endpoint.version).toBe(2);
+    });
+
+    it("keeps permanent exclusion immutable for every cooldown mutation", () => {
+        const endpoint = createEndpoint();
+        const random = vi.fn(() => 0);
+
+        endpoint.excludedReason = "chain-id-mismatch";
+        endpoint.status = "excluded";
+        endpoint.version = 3;
+
+        expect(applyShortCooldown(endpoint, 1_000, { random })).toBe(1_000);
+        expect(applyLongCooldown(endpoint, 2_000, { random })).toBe(2_000);
+        expect(applyEndpointDataCooldown(endpoint, 3_000, { random })).toBe(3_000);
+        excludeEndpointForAuthorization(endpoint);
+
+        expect(endpoint.status).toBe("excluded");
+        expect(endpoint.excludedReason).toBe("chain-id-mismatch");
+        expect(endpoint.cooldownUntil).toBeNull();
+        expect(endpoint.failureStreaks).toEqual({ long: 0, short: 0 });
+        expect(endpoint.version).toBe(3);
+        expect(random).not.toHaveBeenCalled();
     });
 });

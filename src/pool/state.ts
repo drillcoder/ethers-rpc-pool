@@ -42,6 +42,7 @@ export interface EndpointCandidate {
 
 export interface EndpointReservation extends EndpointCandidate {
     readonly probeToken: EndpointProbeToken | null;
+    readonly version: number;
 }
 
 export type EndpointReservationFailureHandler = (error: unknown, endpoint: EndpointState) => void;
@@ -140,14 +141,14 @@ export function reserveEndpoint(network: NetworkState, nowMs: number): EndpointR
     network.selectionCursor = selected.endpoint.endpointNumber % network.endpoints.length;
     selected.endpoint.activeGroups += 1;
     network.activeGroups += 1;
-    return { ...selected, probeToken };
+    return { ...selected, probeToken, version: selected.endpoint.version };
 }
 
 function releaseEndpointReservation(network: NetworkState, reservation: EndpointReservation): void {
     reservation.endpoint.activeGroups -= 1;
     network.activeGroups -= 1;
 
-    if (reservation.probeToken !== null) {
+    if (reservation.probeToken !== null && reservation.endpoint.probeToken === reservation.probeToken) {
         reservation.endpoint.probeToken = null;
         if (reservation.endpoint.status === "probe") {
             reservation.endpoint.status = "cooling-down";
@@ -156,7 +157,12 @@ function releaseEndpointReservation(network: NetworkState, reservation: Endpoint
 }
 
 function recoverProbedEndpoint(reservation: EndpointReservation): void {
-    if (reservation.probeToken === null) {
+    if (
+        reservation.probeToken === null
+        || reservation.endpoint.probeToken !== reservation.probeToken
+        || reservation.endpoint.version !== reservation.version
+        || reservation.endpoint.status === "excluded"
+    ) {
         return;
     }
 
