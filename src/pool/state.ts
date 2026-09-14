@@ -1,8 +1,10 @@
+import { NoUsableRpcEndpointError, OperationTimeoutError } from "../errors/errors.js";
 import type { RpcEndpointExcludedReason, RpcEndpointStatus } from "../observability/types.js";
-import type { RuntimeDependencies } from "./runtime.js";
+import type { RuntimeDependencies, TimerHandle } from "./runtime.js";
 import type { RpcNetworkConfig } from "./types.js";
 
 const latencyEwmaWeight = 0.2;
+const networkStateListeners = new WeakMap<NetworkState, Set<() => void>>();
 
 export interface EndpointFailureStreaks {
     long: number;
@@ -46,6 +48,13 @@ export interface EndpointReservation extends EndpointCandidate {
 }
 
 export type EndpointReservationFailureHandler = (error: unknown, endpoint: EndpointState) => void;
+
+export interface EndpointAvailabilityWaitOptions {
+    readonly deadlineMs: number;
+    readonly runtime: Pick<RuntimeDependencies, "clearTimeout" | "monotonicNow" | "setTimeout">;
+    readonly signal?: AbortSignal;
+    readonly timeoutMs: number;
+}
 
 function createEndpointState(rpcUrl: string, endpointNumber: number): EndpointState {
     return {
@@ -144,6 +153,80 @@ export function reserveEndpoint(network: NetworkState, nowMs: number): EndpointR
     return { ...selected, probeToken, version: selected.endpoint.version };
 }
 
+export function notifyNetworkStateChanged(network: NetworkState): void {
+    for (const listener of networkStateListeners.get(network) ?? []) {
+        listener();
+    }
+}
+
+export function waitForEndpointAvailability(
+    network: NetworkState,
+    options: EndpointAvailabilityWaitOptions,
+): Promise<void> {
+    return new Promise((resolve, reject) => {
+        let timer: TimerHandle | null = null;
+        const listeners = networkStateListeners.get(network) ?? new Set<() => void>();
+        networkStateListeners.set(network, listeners);
+
+        const cleanup = (): void => {
+            listeners.delete(evaluate);
+            options.signal?.removeEventListener("abort", abort);
+            if (timer !== null) {
+                options.runtime.clearTimeout(timer);
+                timer = null;
+            }
+        };
+        const settle = (error?: unknown): void => {
+            cleanup();
+            if (error === undefined) {
+                resolve();
+            } else {
+                // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- Preserve reason.
+                reject(error);
+            }
+        };
+        const abort = (): void => {
+            settle(options.signal?.reason ?? new DOMException("The operation was aborted", "AbortError"));
+        };
+        function evaluate(): void {
+            if (timer !== null) {
+                options.runtime.clearTimeout(timer);
+                timer = null;
+            }
+
+            const nowMs = options.runtime.monotonicNow();
+            if (getEndpointCandidates(network, nowMs).length > 0) {
+                settle();
+                return;
+            }
+
+            if (network.endpoints.every(({ status }) => status === "excluded")) {
+                settle(new NoUsableRpcEndpointError(network.chainId));
+                return;
+            }
+
+            const remainingMs = options.deadlineMs - nowMs;
+            if (remainingMs <= 0) {
+                settle(new OperationTimeoutError(network.chainId, options.timeoutMs));
+                return;
+            }
+
+            const cooldownDeadlines = network.endpoints.flatMap(({ cooldownUntil, status }) =>
+                status === "cooling-down" && cooldownUntil !== null ? [cooldownUntil] : []);
+            const nearestCooldownMs = Math.min(...cooldownDeadlines, options.deadlineMs);
+            timer = options.runtime.setTimeout(evaluate, Math.max(0, nearestCooldownMs - nowMs));
+        }
+
+        listeners.add(evaluate);
+        options.signal?.addEventListener("abort", abort, { once: true });
+        if (options.signal?.aborted === true) {
+            abort();
+        } else {
+            evaluate();
+        }
+    });
+}
+
 function releaseEndpointReservation(network: NetworkState, reservation: EndpointReservation): void {
     reservation.endpoint.activeGroups -= 1;
     network.activeGroups -= 1;
@@ -154,6 +237,8 @@ function releaseEndpointReservation(network: NetworkState, reservation: Endpoint
             reservation.endpoint.status = "cooling-down";
         }
     }
+
+    notifyNetworkStateChanged(network);
 }
 
 function recoverProbedEndpoint(reservation: EndpointReservation): void {
