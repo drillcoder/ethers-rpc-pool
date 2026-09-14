@@ -94,4 +94,15 @@ describe("RpcPoolManager operation entry points", () => {
 
         await expect(manager.executeOnce(1, () => Promise.reject(failure))).rejects.toBe(failure);
     });
+
+    it("deactivates a retryable client when its callback finishes", async () => {
+        const request = vi.fn((_input: string | URL | Request, init?: RequestInit) =>
+            Promise.resolve(rpcResponse(init ?? {})));
+        vi.stubGlobal("fetch", request);
+        const manager = new RpcPoolManager(config);
+        const client = await manager.executeWithRetry(1, (selected) => Promise.resolve(selected));
+
+        await expect(client.getBlockNumber()).rejects.toThrow("RPC client attempt is no longer active");
+        expect(request).toHaveBeenCalledOnce();
+    });
 });
