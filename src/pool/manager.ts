@@ -2,6 +2,7 @@ import { OperationTimeoutError, UnknownNetworkError } from "../errors/errors.js"
 import { EndpointChainIdVerifier } from "../transport/chain-id.js";
 import { EndpointJsonRpcProvider } from "../transport/provider.js";
 import { normalizeManagerConfig } from "./config.js";
+import { createRetryableRpcClient } from "./retryable-client.js";
 import { createRuntime } from "./runtime.js";
 import type { RuntimeDependencies, TimerHandle } from "./runtime.js";
 import {
@@ -93,7 +94,11 @@ export class RpcPoolManager {
         callback: (client: RetryableRpcClient) => Promise<Result>,
         options: RpcExecutionOptions = {},
     ): Promise<Result> {
-        return await this.#execute(chainId, callback, options);
+        return await this.#execute(
+            chainId,
+            async (provider) => await callback(createRetryableRpcClient(provider)),
+            options,
+        );
     }
 
     public async executeOnce<Result>(
