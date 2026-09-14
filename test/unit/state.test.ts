@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 
+import { applyShortCooldown } from "../../src/pool/cooldown.js";
 import {
     createPoolState,
     getEndpointCandidates,
     reserveEndpoint,
+    runEndpointReservation,
     runMeasuredEndpointCall,
     selectEndpointCandidate,
 } from "../../src/pool/state.js";
@@ -204,6 +206,120 @@ describe("candidate inspection and reservation", () => {
         expect(first.status).toBe("probe");
         expect(first.probeToken).not.toBeNull();
         expect(reserveEndpoint(network, 100)).toBeNull();
+    });
+
+    it("recovers a successful probe, resets failure streaks, and releases its slot", async () => {
+        const network = createNetwork();
+        const endpoint = network.endpoints[0];
+
+        if (endpoint === undefined) {
+            throw new Error("Expected test endpoint");
+        }
+
+        endpoint.status = "cooling-down";
+        endpoint.cooldownUntil = 100;
+        endpoint.failureStreaks.long = 2;
+        endpoint.failureStreaks.short = 3;
+        const sibling = network.endpoints[1];
+        if (sibling === undefined) {
+            throw new Error("Expected sibling endpoint");
+        }
+        sibling.status = "excluded";
+
+        const reservation = reserveEndpoint(network, 100);
+        if (reservation === null) {
+            throw new Error("Expected probe reservation");
+        }
+
+        await expect(runEndpointReservation(network, reservation, () => Promise.resolve("recovered"), () => undefined))
+            .resolves.toBe("recovered");
+        expect(endpoint.status).toBe("available");
+        expect(endpoint.cooldownUntil).toBeNull();
+        expect(endpoint.failureStreaks).toEqual({ long: 0, short: 0 });
+        expect(endpoint.probeToken).toBeNull();
+        expect(endpoint.activeGroups).toBe(0);
+        expect(network.activeGroups).toBe(0);
+    });
+
+    it("releases a successful ordinary reservation without changing endpoint health", async () => {
+        const network = createNetwork();
+        const reservation = reserveEndpoint(network, 0);
+
+        if (reservation === null) {
+            throw new Error("Expected ordinary reservation");
+        }
+
+        await expect(runEndpointReservation(network, reservation, () => Promise.resolve(42), () => undefined))
+            .resolves.toBe(42);
+        expect(reservation.endpoint.status).toBe("available");
+        expect(reservation.endpoint.activeGroups).toBe(0);
+        expect(network.activeGroups).toBe(0);
+    });
+
+    it("extends cooldown after a failed probe and always releases its slot", async () => {
+        const network = createNetwork();
+        const endpoint = network.endpoints[0];
+        const error = new Error("probe failed");
+
+        if (endpoint === undefined) {
+            throw new Error("Expected test endpoint");
+        }
+
+        endpoint.status = "cooling-down";
+        endpoint.cooldownUntil = 100;
+        endpoint.failureStreaks.short = 1;
+        const sibling = network.endpoints[1];
+        if (sibling === undefined) {
+            throw new Error("Expected sibling endpoint");
+        }
+        sibling.status = "excluded";
+
+        const reservation = reserveEndpoint(network, 100);
+        if (reservation === null) {
+            throw new Error("Expected probe reservation");
+        }
+
+        await expect(runEndpointReservation(network, reservation, () => Promise.reject(error), (_error, failed) => {
+            applyShortCooldown(failed, 100, { random: () => 0 });
+        })).rejects.toBe(error);
+        expect(endpoint.status).toBe("cooling-down");
+        expect(endpoint.cooldownUntil).toBe(10_100);
+        expect(endpoint.failureStreaks.short).toBe(2);
+        expect(endpoint.probeToken).toBeNull();
+        expect(endpoint.activeGroups).toBe(0);
+        expect(network.activeGroups).toBe(0);
+    });
+
+    it("releases the probe slot when failure handling throws during cancellation", async () => {
+        const network = createNetwork();
+        const endpoint = network.endpoints[0];
+        const cancellation = new DOMException("Cancelled", "AbortError");
+        const handlerError = new Error("failure handler failed");
+
+        if (endpoint === undefined) {
+            throw new Error("Expected test endpoint");
+        }
+
+        endpoint.status = "cooling-down";
+        endpoint.cooldownUntil = 100;
+        const sibling = network.endpoints[1];
+        if (sibling === undefined) {
+            throw new Error("Expected sibling endpoint");
+        }
+        sibling.status = "excluded";
+
+        const reservation = reserveEndpoint(network, 100);
+        if (reservation === null) {
+            throw new Error("Expected probe reservation");
+        }
+
+        await expect(runEndpointReservation(network, reservation, () => Promise.reject(cancellation), () => {
+            throw handlerError;
+        })).rejects.toBe(handlerError);
+        expect(endpoint.status).toBe("cooling-down");
+        expect(endpoint.probeToken).toBeNull();
+        expect(endpoint.activeGroups).toBe(0);
+        expect(network.activeGroups).toBe(0);
     });
 });
 

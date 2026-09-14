@@ -44,6 +44,8 @@ export interface EndpointReservation extends EndpointCandidate {
     readonly probeToken: EndpointProbeToken | null;
 }
 
+export type EndpointReservationFailureHandler = (error: unknown, endpoint: EndpointState) => void;
+
 function createEndpointState(rpcUrl: string, endpointNumber: number): EndpointState {
     return {
         endpointNumber,
@@ -139,6 +141,53 @@ export function reserveEndpoint(network: NetworkState, nowMs: number): EndpointR
     selected.endpoint.activeGroups += 1;
     network.activeGroups += 1;
     return { ...selected, probeToken };
+}
+
+function releaseEndpointReservation(network: NetworkState, reservation: EndpointReservation): void {
+    reservation.endpoint.activeGroups -= 1;
+    network.activeGroups -= 1;
+
+    if (reservation.probeToken !== null) {
+        reservation.endpoint.probeToken = null;
+        if (reservation.endpoint.status === "probe") {
+            reservation.endpoint.status = "cooling-down";
+        }
+    }
+}
+
+function recoverProbedEndpoint(reservation: EndpointReservation): void {
+    if (reservation.probeToken === null) {
+        return;
+    }
+
+    reservation.endpoint.cooldownUntil = null;
+    reservation.endpoint.failureStreaks.long = 0;
+    reservation.endpoint.failureStreaks.short = 0;
+    reservation.endpoint.status = "available";
+}
+
+export async function runEndpointReservation<Result>(
+    network: NetworkState,
+    reservation: EndpointReservation,
+    operation: () => Promise<Result>,
+    onFailure: EndpointReservationFailureHandler,
+): Promise<Result> {
+    let succeeded = false;
+
+    try {
+        const result = await operation();
+        succeeded = true;
+        return result;
+    } catch (error: unknown) {
+        onFailure(error, reservation.endpoint);
+        throw error;
+    } finally {
+        if (succeeded) {
+            recoverProbedEndpoint(reservation);
+        }
+
+        releaseEndpointReservation(network, reservation);
+    }
 }
 
 export function updateEndpointLatency(endpoint: EndpointState, sampleMs: number): void {
