@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { applyShortCooldown } from "../../src/pool/cooldown.js";
+import { applyLongCooldown, applyShortCooldown } from "../../src/pool/cooldown.js";
 import { createPoolState, getEndpointCandidates } from "../../src/pool/state.js";
 import type { EndpointState } from "../../src/pool/state.js";
 
@@ -40,5 +40,28 @@ describe("applyShortCooldown", () => {
 
         expect(endpoint.failureStreaks.short).toBe(6);
         expect(endpoint.failureStreaks.long).toBe(0);
+    });
+});
+
+describe("applyLongCooldown", () => {
+    it("grows from thirty seconds to a five-minute cap independently of the short streak", () => {
+        const endpoint = createEndpoint();
+        const expectedBaseDelays = [30_000, 60_000, 120_000, 240_000, 300_000, 300_000];
+
+        endpoint.failureStreaks.short = 3;
+        for (const [index, expectedBaseDelay] of expectedBaseDelays.entries()) {
+            const nowMs = index * 1_000_000;
+            expect(applyLongCooldown(endpoint, nowMs, { random: () => 0 })).toBe(nowMs + expectedBaseDelay);
+        }
+
+        expect(endpoint.failureStreaks).toEqual({ long: 6, short: 3 });
+    });
+
+    it("uses Retry-After above the policy maximum as the lower bound before jitter", () => {
+        const endpoint = createEndpoint();
+
+        expect(applyLongCooldown(endpoint, 1_000, { random: () => 0.5 }, 600_000)).toBe(661_000);
+        expect(endpoint.cooldownUntil).toBe(661_000);
+        expect(endpoint.status).toBe("cooling-down");
     });
 });
