@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { applyLongCooldown, applyShortCooldown } from "../../src/pool/cooldown.js";
+import {
+    applyEndpointDataCooldown,
+    applyLongCooldown,
+    applyShortCooldown,
+    excludeEndpointForAuthorization,
+} from "../../src/pool/cooldown.js";
 import { createPoolState, getEndpointCandidates } from "../../src/pool/state.js";
 import type { EndpointState } from "../../src/pool/state.js";
 
@@ -63,5 +68,30 @@ describe("applyLongCooldown", () => {
         expect(applyLongCooldown(endpoint, 1_000, { random: () => 0.5 }, 600_000)).toBe(661_000);
         expect(endpoint.cooldownUntil).toBe(661_000);
         expect(endpoint.status).toBe("cooling-down");
+    });
+});
+
+describe("authorization and endpoint-data failures", () => {
+    it("permanently excludes an unauthorized endpoint without a recovery deadline", () => {
+        const endpoint = createEndpoint();
+        const network = { chainId: 1, endpoints: [endpoint], activeGroups: 0, selectionCursor: 0 };
+
+        endpoint.cooldownUntil = 10_000;
+        excludeEndpointForAuthorization(endpoint);
+
+        expect(endpoint.status).toBe("excluded");
+        expect(endpoint.excludedReason).toBe("authorization");
+        expect(endpoint.cooldownUntil).toBeNull();
+        expect(getEndpointCandidates(network, Infinity)).toEqual([]);
+    });
+
+    it("uses a fixed five-second endpoint-data cooldown without changing failure streaks", () => {
+        const endpoint = createEndpoint();
+
+        expect(applyEndpointDataCooldown(endpoint, 1_000, { random: () => 0 })).toBe(6_000);
+        expect(applyEndpointDataCooldown(endpoint, 10_000, { random: () => 1 })).toBe(16_000);
+        expect(endpoint.status).toBe("cooling-down");
+        expect(endpoint.cooldownUntil).toBe(16_000);
+        expect(endpoint.failureStreaks).toEqual({ long: 0, short: 0 });
     });
 });

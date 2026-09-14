@@ -52,3 +52,22 @@ export function applyLongCooldown(
 ): number {
     return applyCooldown(endpoint, nowMs, runtime, longPolicy, retryAfterMs);
 }
+
+export function applyEndpointDataCooldown(
+    endpoint: EndpointState,
+    nowMs: number,
+    runtime: Pick<RuntimeDependencies, "random">,
+): number {
+    const cooldownDelayMs = shortBaseDelayMs * (1 + maximumJitterRatio * runtime.random());
+    const cooldownUntil = nowMs + cooldownDelayMs;
+
+    endpoint.cooldownUntil = cooldownUntil;
+    endpoint.status = "cooling-down";
+    return cooldownUntil;
+}
+
+export function excludeEndpointForAuthorization(endpoint: EndpointState): void {
+    endpoint.cooldownUntil = null;
+    endpoint.excludedReason = "authorization";
+    endpoint.status = "excluded";
+}
