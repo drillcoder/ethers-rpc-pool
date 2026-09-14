@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { createPoolState, reserveEndpoint, runMeasuredEndpointCall } from "../../src/pool/state.js";
+import {
+    createPoolState,
+    getEndpointCandidates,
+    reserveEndpoint,
+    runMeasuredEndpointCall,
+    selectEndpointCandidate,
+} from "../../src/pool/state.js";
 import type { NetworkState } from "../../src/pool/state.js";
 
 const networks = [
@@ -98,7 +104,7 @@ describe("reserveEndpoint", () => {
         first.latencyEwmaMs = 10;
         second.latencyEwmaMs = 100;
 
-        expect(reserveEndpoint(network)).toBe(second);
+        expect(reserveEndpoint(network, 0)?.endpoint).toBe(second);
         expect(second.activeGroups).toBe(1);
         expect(network.activeGroups).toBe(1);
     });
@@ -115,7 +121,7 @@ describe("reserveEndpoint", () => {
         first.latencyEwmaMs = 100;
         second.latencyEwmaMs = 20;
 
-        expect(reserveEndpoint(network)).toBe(second);
+        expect(reserveEndpoint(network, 0)?.endpoint).toBe(second);
     });
 
     it("uses round-robin for cold start and equal measured latency", () => {
@@ -127,19 +133,19 @@ describe("reserveEndpoint", () => {
             throw new Error("Expected test endpoints");
         }
 
-        expect(reserveEndpoint(network)).toBe(first);
+        expect(reserveEndpoint(network, 0)?.endpoint).toBe(first);
         first.activeGroups = 0;
         network.activeGroups = 0;
-        expect(reserveEndpoint(network)).toBe(second);
+        expect(reserveEndpoint(network, 0)?.endpoint).toBe(second);
 
         second.activeGroups = 0;
         network.activeGroups = 0;
         first.latencyEwmaMs = 50;
         second.latencyEwmaMs = 50;
-        expect(reserveEndpoint(network)).toBe(first);
+        expect(reserveEndpoint(network, 0)?.endpoint).toBe(first);
         first.activeGroups = 0;
         network.activeGroups = 0;
-        expect(reserveEndpoint(network)).toBe(second);
+        expect(reserveEndpoint(network, 0)?.endpoint).toBe(second);
     });
 
     it("returns null when no endpoint is available", () => {
@@ -149,8 +155,55 @@ describe("reserveEndpoint", () => {
             endpoint.status = "cooling-down";
         }
 
-        expect(reserveEndpoint(network)).toBeNull();
+        expect(reserveEndpoint(network, 0)).toBeNull();
         expect(network.activeGroups).toBe(0);
+    });
+});
+
+describe("candidate inspection and reservation", () => {
+    it("inspects an expired cooldown without reserving its probe slot", () => {
+        const network = createNetwork();
+        const first = network.endpoints[0];
+        const second = network.endpoints[1];
+
+        if (first === undefined || second === undefined) {
+            throw new Error("Expected test endpoints");
+        }
+
+        first.status = "cooling-down";
+        first.cooldownUntil = 100;
+        second.status = "excluded";
+
+        const candidates = getEndpointCandidates(network, 100);
+        expect(candidates).toEqual([{ endpoint: first, requiresProbe: true }]);
+        expect(selectEndpointCandidate(network, candidates)).toEqual(candidates[0]);
+        expect(first.status).toBe("cooling-down");
+        expect(first.probeToken).toBeNull();
+        expect(first.activeGroups).toBe(0);
+        expect(network.activeGroups).toBe(0);
+        expect(network.selectionCursor).toBe(0);
+    });
+
+    it("atomically permits only one reservation of an expired endpoint", () => {
+        const network = createNetwork();
+        const first = network.endpoints[0];
+        const second = network.endpoints[1];
+
+        if (first === undefined || second === undefined) {
+            throw new Error("Expected test endpoints");
+        }
+
+        first.status = "cooling-down";
+        first.cooldownUntil = 100;
+        second.status = "cooling-down";
+        second.cooldownUntil = 101;
+
+        const reservation = reserveEndpoint(network, 100);
+        expect(reservation?.endpoint).toBe(first);
+        expect(reservation?.probeToken).toBe(first.probeToken);
+        expect(first.status).toBe("probe");
+        expect(first.probeToken).not.toBeNull();
+        expect(reserveEndpoint(network, 100)).toBeNull();
     });
 });
 

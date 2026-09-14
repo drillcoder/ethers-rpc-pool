@@ -35,6 +35,15 @@ export interface PoolState {
     readonly networks: ReadonlyMap<number, NetworkState>;
 }
 
+export interface EndpointCandidate {
+    readonly endpoint: EndpointState;
+    readonly requiresProbe: boolean;
+}
+
+export interface EndpointReservation extends EndpointCandidate {
+    readonly probeToken: EndpointProbeToken | null;
+}
+
 function createEndpointState(rpcUrl: string, endpointNumber: number): EndpointState {
     return {
         endpointNumber,
@@ -69,39 +78,67 @@ export function createPoolState(networks: readonly RpcNetworkConfig[]): PoolStat
     };
 }
 
-function selectRoundRobin(network: NetworkState, candidates: readonly EndpointState[]): EndpointState {
-    const selected = candidates.reduce((current, candidate) => {
-        const currentDistance = (current.endpointNumber - 1 - network.selectionCursor + network.endpoints.length)
-            % network.endpoints.length;
-        const candidateDistance = (candidate.endpointNumber - 1 - network.selectionCursor + network.endpoints.length)
-            % network.endpoints.length;
+function selectRoundRobin(network: NetworkState, candidates: readonly EndpointCandidate[]): EndpointCandidate {
+    const endpointCount = network.endpoints.length;
+    const cursor = network.selectionCursor;
+    return candidates.reduce((current, candidate) => {
+        const currentDistance = (current.endpoint.endpointNumber - 1 - cursor + endpointCount) % endpointCount;
+        const candidateDistance = (candidate.endpoint.endpointNumber - 1 - cursor + endpointCount) % endpointCount;
         return candidateDistance < currentDistance ? candidate : current;
     });
-
-    network.selectionCursor = selected.endpointNumber % network.endpoints.length;
-    return selected;
 }
 
-export function reserveEndpoint(network: NetworkState): EndpointState | null {
-    const available = network.endpoints.filter((endpoint) => endpoint.status === "available");
-    if (available.length === 0) {
+export function getEndpointCandidates(network: NetworkState, nowMs: number): readonly EndpointCandidate[] {
+    return network.endpoints.flatMap<EndpointCandidate>((endpoint) => {
+        if (endpoint.status === "available") {
+            return [{ endpoint, requiresProbe: false }];
+        }
+
+        if (endpoint.status === "cooling-down" && endpoint.cooldownUntil !== null && endpoint.cooldownUntil <= nowMs) {
+            return [{ endpoint, requiresProbe: true }];
+        }
+
+        return [];
+    });
+}
+
+export function selectEndpointCandidate(
+    network: NetworkState,
+    candidates: readonly EndpointCandidate[],
+): EndpointCandidate | null {
+    if (candidates.length === 0) {
         return null;
     }
 
-    const minimumActiveGroups = Math.min(...available.map((endpoint) => endpoint.activeGroups));
-    const leastActive = available.filter((endpoint) => endpoint.activeGroups === minimumActiveGroups);
-    let candidates = leastActive.filter((endpoint) => endpoint.latencyEwmaMs === null);
+    const minimumActiveGroups = Math.min(...candidates.map(({ endpoint }) => endpoint.activeGroups));
+    const leastActive = candidates.filter(({ endpoint }) => endpoint.activeGroups === minimumActiveGroups);
+    let preferred = leastActive.filter(({ endpoint }) => endpoint.latencyEwmaMs === null);
 
-    if (candidates.length === 0) {
-        const measured = leastActive as readonly (EndpointState & { latencyEwmaMs: number })[];
-        const minimumLatency = Math.min(...measured.map((endpoint) => endpoint.latencyEwmaMs));
-        candidates = leastActive.filter((endpoint) => endpoint.latencyEwmaMs === minimumLatency);
+    if (preferred.length === 0) {
+        const measured = leastActive as readonly (EndpointCandidate & { endpoint: { latencyEwmaMs: number } })[];
+        const minimumLatency = Math.min(...measured.map(({ endpoint }) => endpoint.latencyEwmaMs));
+        preferred = leastActive.filter(({ endpoint }) => endpoint.latencyEwmaMs === minimumLatency);
     }
 
-    const selected = selectRoundRobin(network, candidates);
-    selected.activeGroups += 1;
+    return selectRoundRobin(network, preferred);
+}
+
+export function reserveEndpoint(network: NetworkState, nowMs: number): EndpointReservation | null {
+    const selected = selectEndpointCandidate(network, getEndpointCandidates(network, nowMs));
+    if (selected === null) {
+        return null;
+    }
+
+    const probeToken = selected.requiresProbe ? Symbol("endpoint-probe") : null;
+    if (probeToken !== null) {
+        selected.endpoint.probeToken = probeToken;
+        selected.endpoint.status = "probe";
+    }
+
+    network.selectionCursor = selected.endpoint.endpointNumber % network.endpoints.length;
+    selected.endpoint.activeGroups += 1;
     network.activeGroups += 1;
-    return selected;
+    return { ...selected, probeToken };
 }
 
 export function updateEndpointLatency(endpoint: EndpointState, sampleMs: number): void {
