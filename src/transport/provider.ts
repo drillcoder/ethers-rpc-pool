@@ -2,145 +2,145 @@ import { AsyncLocalStorage } from "node:async_hooks";
 
 import { JsonRpcProvider } from "ethers";
 import type {
-  JsonRpcError,
-  JsonRpcPayload,
-  JsonRpcResult,
-  Networkish,
+    JsonRpcError,
+    JsonRpcPayload,
+    JsonRpcResult,
+    Networkish,
 } from "ethers";
 
 import { createRuntime } from "../pool/runtime.js";
 import type { RuntimeDependencies } from "../pool/runtime.js";
 
 export type HttpRequest = (
-  input: string,
-  init: RequestInit,
+    input: string,
+    init: RequestInit,
 ) => Promise<Response>;
 
 export interface EndpointJsonRpcProviderOptions {
-  readonly requestTimeoutMs: number;
-  readonly request?: HttpRequest;
-  readonly runtime?: Partial<RuntimeDependencies>;
+    readonly requestTimeoutMs: number;
+    readonly request?: HttpRequest;
+    readonly runtime?: Partial<RuntimeDependencies>;
 }
 
 export class RpcTransportResponseError extends Error {
-  public override readonly name = "RpcTransportResponseError";
-  public readonly headers: Readonly<Record<string, string>>;
-  public readonly jsonRpcError: Readonly<JsonRpcError["error"]> | undefined;
-  public readonly status: number;
+    public override readonly name = "RpcTransportResponseError";
+    public readonly headers: Readonly<Record<string, string>>;
+    public readonly jsonRpcError: Readonly<JsonRpcError["error"]> | undefined;
+    public readonly status: number;
 
-  public constructor(
-    status: number,
-    headers: Readonly<Record<string, string>>,
-    jsonRpcError: Readonly<JsonRpcError["error"]> | undefined,
-    options?: ErrorOptions,
-  ) {
-    super("RPC transport received an error response", options);
-    this.status = status;
-    this.headers = headers;
-    this.jsonRpcError = jsonRpcError;
-  }
+    public constructor(
+        status: number,
+        headers: Readonly<Record<string, string>>,
+        jsonRpcError: Readonly<JsonRpcError["error"]> | undefined,
+        options?: ErrorOptions,
+    ) {
+        super("RPC transport received an error response", options);
+        this.status = status;
+        this.headers = headers;
+        this.jsonRpcError = jsonRpcError;
+    }
 }
 
 export class RpcRequestTimeoutError extends Error {
-  public override readonly name = "RpcRequestTimeoutError";
-  public readonly timeoutMs: number;
+    public override readonly name = "RpcRequestTimeoutError";
+    public readonly timeoutMs: number;
 
-  public constructor(timeoutMs: number) {
-    super(`RPC request timed out after ${String(timeoutMs)} ms`);
-    this.timeoutMs = timeoutMs;
-  }
+    public constructor(timeoutMs: number) {
+        super(`RPC request timed out after ${String(timeoutMs)} ms`);
+        this.timeoutMs = timeoutMs;
+    }
 }
 
 export class EndpointJsonRpcProvider extends JsonRpcProvider {
-  readonly #deadline = new AsyncLocalStorage<number>();
-  readonly #request: HttpRequest;
-  readonly #requestTimeoutMs: number;
-  readonly #runtime: RuntimeDependencies;
-  readonly #url: string;
+    readonly #deadline = new AsyncLocalStorage<number>();
+    readonly #request: HttpRequest;
+    readonly #requestTimeoutMs: number;
+    readonly #runtime: RuntimeDependencies;
+    readonly #url: string;
 
-  public constructor(
-    url: string,
-    network: Networkish,
-    options: EndpointJsonRpcProviderOptions,
-  ) {
-    super(url, network, {
-      batchMaxCount: 1,
-      staticNetwork: true,
-    });
+    public constructor(
+        url: string,
+        network: Networkish,
+        options: EndpointJsonRpcProviderOptions,
+    ) {
+        super(url, network, {
+            batchMaxCount: 1,
+            staticNetwork: true,
+        });
 
-    this.#url = url;
-    this.#request = options.request ?? globalThis.fetch;
-    this.#requestTimeoutMs = options.requestTimeoutMs;
-    this.#runtime = createRuntime(options.runtime);
-  }
-
-  public runWithDeadline<Result>(deadlineMs: number, operation: () => Promise<Result>): Promise<Result> {
-    return this.#deadline.run(deadlineMs, operation);
-  }
-
-  public override async _send(payload: JsonRpcPayload | JsonRpcPayload[]): Promise<JsonRpcResult[]> {
-    const payloads = Array.isArray(payload) ? payload : [payload];
-
-    return await Promise.all(
-      payloads.map(async (singlePayload) => await this.#sendOne(singlePayload)),
-    );
-  }
-
-  async #sendOne(payload: JsonRpcPayload): Promise<JsonRpcResult> {
-    const deadlineMs = this.#deadline.getStore();
-    const remainingMs =
-      deadlineMs === undefined
-        ? Number.POSITIVE_INFINITY
-        : deadlineMs - this.#runtime.monotonicNow();
-    if (remainingMs <= 0) {
-      throw new RpcRequestTimeoutError(0);
+        this.#url = url;
+        this.#request = options.request ?? globalThis.fetch;
+        this.#requestTimeoutMs = options.requestTimeoutMs;
+        this.#runtime = createRuntime(options.runtime);
     }
 
-    const timeoutMs = Math.min(this.#requestTimeoutMs, remainingMs);
-    const controller = new AbortController();
-    const timeout = this.#runtime.setTimeout(() => {
-      controller.abort(new RpcRequestTimeoutError(timeoutMs));
-    }, timeoutMs);
-
-    try {
-      const response = await this.#request(this.#url, {
-        body: JSON.stringify(payload),
-        headers: {
-          "content-type": "application/json",
-        },
-        method: "POST",
-        signal: controller.signal,
-      });
-      const headers = Object.freeze(
-        Object.fromEntries(response.headers.entries()),
-      );
-      let body: unknown;
-
-      try {
-        body = await response.json();
-      } catch (cause) {
-        throw new RpcTransportResponseError(
-          response.status,
-          headers,
-          undefined,
-          { cause },
-        );
-      }
-
-      const jsonRpcError = (body as Partial<JsonRpcError>).error;
-      if (!response.ok || jsonRpcError !== undefined) {
-        throw new RpcTransportResponseError(
-          response.status,
-          headers,
-          jsonRpcError === undefined
-            ? undefined
-            : Object.freeze({ ...jsonRpcError }),
-        );
-      }
-
-      return body as JsonRpcResult;
-    } finally {
-      this.#runtime.clearTimeout(timeout);
+    public runWithDeadline<Result>(deadlineMs: number, operation: () => Promise<Result>): Promise<Result> {
+        return this.#deadline.run(deadlineMs, operation);
     }
-  }
+
+    public override async _send(payload: JsonRpcPayload | JsonRpcPayload[]): Promise<JsonRpcResult[]> {
+        const payloads = Array.isArray(payload) ? payload : [payload];
+
+        return await Promise.all(
+            payloads.map(async (singlePayload) => await this.#sendOne(singlePayload)),
+        );
+    }
+
+    async #sendOne(payload: JsonRpcPayload): Promise<JsonRpcResult> {
+        const deadlineMs = this.#deadline.getStore();
+        const remainingMs =
+            deadlineMs === undefined
+                ? Number.POSITIVE_INFINITY
+                : deadlineMs - this.#runtime.monotonicNow();
+        if (remainingMs <= 0) {
+            throw new RpcRequestTimeoutError(0);
+        }
+
+        const timeoutMs = Math.min(this.#requestTimeoutMs, remainingMs);
+        const controller = new AbortController();
+        const timeout = this.#runtime.setTimeout(() => {
+            controller.abort(new RpcRequestTimeoutError(timeoutMs));
+        }, timeoutMs);
+
+        try {
+            const response = await this.#request(this.#url, {
+                body: JSON.stringify(payload),
+                headers: {
+                    "content-type": "application/json",
+                },
+                method: "POST",
+                signal: controller.signal,
+            });
+            const headers = Object.freeze(
+                Object.fromEntries(response.headers.entries()),
+            );
+            let body: unknown;
+
+            try {
+                body = await response.json();
+            } catch (cause) {
+                throw new RpcTransportResponseError(
+                    response.status,
+                    headers,
+                    undefined,
+                    { cause },
+                );
+            }
+
+            const jsonRpcError = (body as Partial<JsonRpcError>).error;
+            if (!response.ok || jsonRpcError !== undefined) {
+                throw new RpcTransportResponseError(
+                    response.status,
+                    headers,
+                    jsonRpcError === undefined
+                        ? undefined
+                        : Object.freeze({ ...jsonRpcError }),
+                );
+            }
+
+            return body as JsonRpcResult;
+        } finally {
+            this.#runtime.clearTimeout(timeout);
+        }
+    }
 }
