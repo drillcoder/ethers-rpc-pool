@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { createPoolState } from "../../src/pool/state.js";
+import { createPoolState, reserveEndpoint } from "../../src/pool/state.js";
+import type { NetworkState } from "../../src/pool/state.js";
 
 const networks = [
   { chainId: 1, rpcUrls: ["https://first.example/", "https://second.example/"] },
@@ -15,6 +16,7 @@ describe("createPoolState", () => {
     expect(state.networks.get(1)).toEqual({
       chainId: 1,
       activeGroups: 0,
+      selectionCursor: 0,
       endpoints: [
         {
           endpointNumber: 1,
@@ -70,5 +72,84 @@ describe("createPoolState", () => {
     expect(secondEndpoint?.probeToken).toBeNull();
     expect(secondEndpoint?.status).toBe("available");
     expect(secondEndpoint?.version).toBe(0);
+  });
+});
+
+function createNetwork(): NetworkState {
+  const network = createPoolState(networks).networks.get(1);
+  if (network === undefined) {
+    throw new Error("Expected test network");
+  }
+
+  return network;
+}
+
+describe("reserveEndpoint", () => {
+  it("reserves the least-active endpoint before considering latency", () => {
+    const network = createNetwork();
+    const first = network.endpoints[0];
+    const second = network.endpoints[1];
+
+    if (first === undefined || second === undefined) {
+      throw new Error("Expected test endpoints");
+    }
+
+    first.activeGroups = 1;
+    first.latencyEwmaMs = 10;
+    second.latencyEwmaMs = 100;
+
+    expect(reserveEndpoint(network)).toBe(second);
+    expect(second.activeGroups).toBe(1);
+    expect(network.activeGroups).toBe(1);
+  });
+
+  it("reserves the lowest-latency endpoint when load is equal", () => {
+    const network = createNetwork();
+    const first = network.endpoints[0];
+    const second = network.endpoints[1];
+
+    if (first === undefined || second === undefined) {
+      throw new Error("Expected test endpoints");
+    }
+
+    first.latencyEwmaMs = 100;
+    second.latencyEwmaMs = 20;
+
+    expect(reserveEndpoint(network)).toBe(second);
+  });
+
+  it("uses round-robin for cold start and equal measured latency", () => {
+    const network = createNetwork();
+    const first = network.endpoints[0];
+    const second = network.endpoints[1];
+
+    if (first === undefined || second === undefined) {
+      throw new Error("Expected test endpoints");
+    }
+
+    expect(reserveEndpoint(network)).toBe(first);
+    first.activeGroups = 0;
+    network.activeGroups = 0;
+    expect(reserveEndpoint(network)).toBe(second);
+
+    second.activeGroups = 0;
+    network.activeGroups = 0;
+    first.latencyEwmaMs = 50;
+    second.latencyEwmaMs = 50;
+    expect(reserveEndpoint(network)).toBe(first);
+    first.activeGroups = 0;
+    network.activeGroups = 0;
+    expect(reserveEndpoint(network)).toBe(second);
+  });
+
+  it("returns null when no endpoint is available", () => {
+    const network = createNetwork();
+
+    for (const endpoint of network.endpoints) {
+      endpoint.status = "cooling-down";
+    }
+
+    expect(reserveEndpoint(network)).toBeNull();
+    expect(network.activeGroups).toBe(0);
   });
 });
