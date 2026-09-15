@@ -13,6 +13,14 @@ export interface SingleRpcAttempt {
     deactivate(): Promise<void>;
 }
 
+export class SingleRpcCallError extends Error {
+    public override readonly name = "SingleRpcCallError";
+
+    public constructor(cause: unknown) {
+        super("Single-attempt RPC client call failed", { cause });
+    }
+}
+
 export function createSingleRpcAttempt(provider: EndpointJsonRpcProvider): SingleRpcAttempt {
     let active = true;
     const listeners: FacadeListener[] = [];
@@ -92,9 +100,18 @@ export function createSingleRpcAttempt(provider: EndpointJsonRpcProvider): Singl
                 if (!active) {
                     return Promise.reject(new Error("RPC client attempt is no longer active"));
                 }
-                const result: unknown = Reflect.apply(value, target, args);
+                let result: unknown;
+                try {
+                    result = Reflect.apply(value, target, args);
+                } catch (cause: unknown) {
+                    throw new SingleRpcCallError(cause);
+                }
                 if (result instanceof Promise) {
-                    return result.then((resolved: unknown) => resolved === target ? facade : resolved);
+                    return result
+                        .then((resolved: unknown) => resolved === target ? facade : resolved)
+                        .catch((cause: unknown) => {
+                            throw new SingleRpcCallError(cause);
+                        });
                 }
                 return result === target ? facade : result;
             };

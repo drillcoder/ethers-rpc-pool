@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OperationTimeoutError, RpcEndpointDataError, RpcPoolManager, UnknownNetworkError } from "../../src/index.js";
-import type { RetryableRpcClient, RpcPoolManagerConfig } from "../../src/index.js";
+import type { RetryableRpcClient, RpcPoolManagerConfig, SingleAttemptRpcClient } from "../../src/index.js";
 
 const config: RpcPoolManagerConfig = {
     networks: [{ chainId: 1, rpcUrls: ["https://rpc.example"] }],
@@ -13,6 +13,10 @@ function rpcResponse(init: RequestInit): Response {
     const payload = JSON.parse(init.body as string) as { id: number; method: string };
     const result = payload.method === "eth_chainId" ? "0x1" : "0x2a";
     return Response.json({ id: payload.id, jsonrpc: "2.0", result });
+}
+
+function requestUrl(input: string | URL | Request): string {
+    return typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
 }
 
 describe("RpcPoolManager operation entry points", () => {
@@ -109,7 +113,7 @@ describe("RpcPoolManager operation entry points", () => {
     it("restarts the whole callback on another endpoint after a retryable client failure", async () => {
         const calls = new Map<string, string[]>();
         vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
-            const endpoint = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+            const endpoint = requestUrl(input);
             const payload = JSON.parse(init?.body as string) as { id: number; method: string };
             const methods = calls.get(endpoint) ?? [];
             methods.push(payload.method);
@@ -153,5 +157,82 @@ describe("RpcPoolManager operation entry points", () => {
         const domainCallback = vi.fn(() => Promise.reject(failure));
         await expect(manager.executeWithRetry(1, domainCallback)).rejects.toBe(failure);
         expect(domainCallback).toHaveBeenCalledOnce();
+    });
+
+    it("switches endpoints after chain verification failure without starting the single callback twice", async () => {
+        const methods = new Map<string, string[]>();
+        vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
+            const endpoint = requestUrl(input);
+            const payload = JSON.parse(init?.body as string) as { id: number; method: string };
+            methods.set(endpoint, [...(methods.get(endpoint) ?? []), payload.method]);
+            if (endpoint.includes("first")) {
+                return Promise.reject(new TypeError("chain check failed"));
+            }
+            return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x1" }));
+        }));
+        const manager = new RpcPoolManager({
+            ...config,
+            networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
+        });
+        const callback = vi.fn(() => Promise.resolve("done"));
+
+        await expect(manager.executeOnce(1, callback)).resolves.toBe("done");
+        expect(callback).toHaveBeenCalledOnce();
+        expect(methods.get("https://first.example/")).toEqual(["eth_chainId"]);
+        expect(methods.get("https://second.example/")).toEqual(["eth_chainId"]);
+    });
+
+    it("returns a started single-attempt transport failure without retrying its callback or request", async () => {
+        const failure = new TypeError("response lost");
+        const methods = new Map<string, string[]>();
+        vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
+            const endpoint = requestUrl(input);
+            const payload = JSON.parse(init?.body as string) as { id: number; method: string };
+            methods.set(endpoint, [...(methods.get(endpoint) ?? []), payload.method]);
+            if (payload.method === "eth_sendRawTransaction") {
+                return Promise.reject(failure);
+            }
+            return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x1" }));
+        }));
+        const manager = new RpcPoolManager({
+            ...config,
+            networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
+        });
+        const callback = vi.fn<(client: SingleAttemptRpcClient) => Promise<unknown>>(
+            async (client) => {
+                await client.send("eth_sendRawTransaction", ["0x01"]);
+            },
+        );
+
+        await expect(manager.executeOnce(1, callback)).rejects.toBe(failure);
+        expect(callback).toHaveBeenCalledOnce();
+        expect(methods.get("https://first.example/")).toEqual(["eth_chainId", "eth_sendRawTransaction"]);
+        expect(methods.has("https://second.example/")).toBe(false);
+    });
+
+    it("cools endpoint data failures without retrying a started single callback", async () => {
+        const endpoints: string[] = [];
+        vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
+            const endpoint = requestUrl(input);
+            endpoints.push(endpoint);
+            return Promise.resolve(rpcResponse(init ?? {}));
+        }));
+        const manager = new RpcPoolManager({
+            ...config,
+            networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
+        });
+        const failure = new RpcEndpointDataError("invalid response");
+        const callback = vi.fn(() => Promise.reject(failure));
+
+        await expect(manager.executeOnce(1, callback)).rejects.toBe(failure);
+        expect(callback).toHaveBeenCalledOnce();
+        await manager.executeOnce(1, async (client) => {
+            await client.send("debug_custom", []);
+        });
+        expect(endpoints).toEqual([
+            "https://first.example/",
+            "https://second.example/",
+            "https://second.example/",
+        ]);
     });
 });

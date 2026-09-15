@@ -1,7 +1,7 @@
 import { JsonRpcProvider, Wallet } from "ethers";
 import { describe, expect, it, vi } from "vitest";
 
-import { createSingleRpcAttempt } from "../../src/pool/single-attempt-client.js";
+import { createSingleRpcAttempt, SingleRpcCallError } from "../../src/pool/single-attempt-client.js";
 import { EndpointJsonRpcProvider } from "../../src/transport/provider.js";
 
 function createProvider(): EndpointJsonRpcProvider {
@@ -29,7 +29,7 @@ describe("createSingleRpcAttempt", () => {
         const attempt = createSingleRpcAttempt(provider);
 
         await expect(attempt.client.send("debug_custom", [1])).resolves.toBe("raw-result");
-        await expect(attempt.client.broadcastTransaction("0x01")).rejects.toBe(failure);
+        await expect(attempt.client.broadcastTransaction("0x01")).rejects.toEqual(new SingleRpcCallError(failure));
         expect(send).toHaveBeenCalledWith("debug_custom", [1]);
         expect(broadcast).toHaveBeenCalledWith("0x01");
 
