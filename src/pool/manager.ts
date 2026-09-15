@@ -142,7 +142,8 @@ export class RpcPoolManager {
             network,
             timeoutMs,
             deadlineMs,
-            async () => await this.#executeRetryAttempt(network, callback, options, timeoutMs, deadlineMs),
+            async (termination) =>
+                await this.#executeRetryAttempt(network, callback, options, timeoutMs, deadlineMs, termination),
             options.signal,
         );
     }
@@ -162,7 +163,8 @@ export class RpcPoolManager {
             network,
             timeoutMs,
             deadlineMs,
-            async () => await this.#executeOnceAttempt(network, callback, options, timeoutMs, deadlineMs),
+            async (termination) =>
+                await this.#executeOnceAttempt(network, callback, options, timeoutMs, deadlineMs, termination),
             options.signal,
         );
     }
@@ -173,11 +175,12 @@ export class RpcPoolManager {
         options: RpcExecutionOptions,
         timeoutMs: number,
         deadlineMs: number,
+        termination: Promise<never>,
     ): Promise<Result> {
         const reservation = reserveEndpoint(network, this.#runtime.monotonicNow());
         if (reservation === null) {
             await this.#waitForEndpoint(network, options, timeoutMs, deadlineMs);
-            return await this.#executeOnceAttempt(network, callback, options, timeoutMs, deadlineMs);
+            return await this.#executeOnceAttempt(network, callback, options, timeoutMs, deadlineMs, termination);
         }
 
         const endpoint = reservation.endpoint;
@@ -195,7 +198,10 @@ export class RpcPoolManager {
                         () => isEndpointReservationCurrent(reservation),
                     );
                     try {
-                        return await raceWithAbort(callback(attempt.client), options.signal);
+                        return await Promise.race([
+                            raceWithAbort(callback(attempt.client), options.signal),
+                            termination,
+                        ]);
                     } finally {
                         await attempt.deactivate();
                     }
@@ -209,7 +215,7 @@ export class RpcPoolManager {
             if (!decision.retry) {
                 throw decision.error;
             }
-            return await this.#executeOnceAttempt(network, callback, options, timeoutMs, deadlineMs);
+            return await this.#executeOnceAttempt(network, callback, options, timeoutMs, deadlineMs, termination);
         }
     }
 
@@ -219,11 +225,12 @@ export class RpcPoolManager {
         options: RpcExecutionOptions,
         timeoutMs: number,
         deadlineMs: number,
+        termination: Promise<never>,
     ): Promise<Result> {
         const reservation = reserveEndpoint(network, this.#runtime.monotonicNow());
         if (reservation === null) {
             await this.#waitForEndpoint(network, options, timeoutMs, deadlineMs);
-            return await this.#executeRetryAttempt(network, callback, options, timeoutMs, deadlineMs);
+            return await this.#executeRetryAttempt(network, callback, options, timeoutMs, deadlineMs, termination);
         }
 
         const endpoint = reservation.endpoint;
@@ -241,7 +248,10 @@ export class RpcPoolManager {
                         () => isEndpointReservationCurrent(reservation),
                     );
                     try {
-                        return await raceWithAbort(callback(attempt.client), options.signal);
+                        return await Promise.race([
+                            raceWithAbort(callback(attempt.client), options.signal),
+                            termination,
+                        ]);
                     } finally {
                         attempt.deactivate();
                     }
@@ -255,7 +265,7 @@ export class RpcPoolManager {
             if (!decision.retry) {
                 throw decision.error;
             }
-            return await this.#executeRetryAttempt(network, callback, options, timeoutMs, deadlineMs);
+            return await this.#executeRetryAttempt(network, callback, options, timeoutMs, deadlineMs, termination);
         }
     }
 
@@ -345,13 +355,13 @@ export class RpcPoolManager {
         network: NetworkState,
         timeoutMs: number,
         deadlineMs: number,
-        operation: () => Promise<Result>,
+        operation: (termination: Promise<never>) => Promise<Result>,
         signal: AbortSignal | undefined,
     ): Promise<Result> {
         const timeout = new OperationDeadline(this.#runtime, network.chainId, timeoutMs, deadlineMs);
 
         try {
-            return await raceWithAbort(Promise.race([operation(), timeout.promise]), signal);
+            return await raceWithAbort(operation(timeout.promise), signal);
         } finally {
             timeout.clear();
         }

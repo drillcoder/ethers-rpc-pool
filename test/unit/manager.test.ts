@@ -2,7 +2,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OperationTimeoutError, RpcEndpointDataError, RpcPoolManager, UnknownNetworkError } from "../../src/index.js";
 import { RpcTransportResponseError } from "../../src/transport/provider.js";
-import type { RetryableRpcClient, RpcPoolManagerConfig, SingleAttemptRpcClient } from "../../src/index.js";
+import type {
+    RetryableRpcClient,
+    RpcExecutionOptions,
+    RpcPoolManagerConfig,
+    SingleAttemptRpcClient,
+} from "../../src/index.js";
 
 const config: RpcPoolManagerConfig = {
     networks: [{ chainId: 1, rpcUrls: ["https://rpc.example"] }],
@@ -20,15 +25,15 @@ function requestUrl(input: string | URL | Request): string {
     return typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
 }
 
-function executeWithSignal<Result>(
+function executeInMode<Result>(
     manager: RpcPoolManager,
     mode: "retry" | "once",
     callback: (client: RetryableRpcClient | SingleAttemptRpcClient) => Promise<Result>,
-    signal: AbortSignal,
+    options: RpcExecutionOptions,
 ): Promise<Result> {
     return mode === "retry"
-        ? manager.executeWithRetry(1, callback, { signal })
-        : manager.executeOnce(1, callback, { signal });
+        ? manager.executeWithRetry(1, callback, options)
+        : manager.executeOnce(1, callback, options);
 }
 
 describe("RpcPoolManager operation entry points", () => {
@@ -93,6 +98,27 @@ describe("RpcPoolManager operation entry points", () => {
         await rejection;
     });
 
+    it.each(["retry", "once"] as const)("deactivates the %s client when its callback times out", async (mode) => {
+        vi.useFakeTimers();
+        const request = vi.fn((_input: string | URL | Request, init?: RequestInit) =>
+            Promise.resolve(rpcResponse(init ?? {})));
+        vi.stubGlobal("fetch", request);
+        const manager = new RpcPoolManager(config);
+        let selectedClient: RetryableRpcClient | SingleAttemptRpcClient | undefined;
+        const callback = vi.fn(async (client: RetryableRpcClient | SingleAttemptRpcClient) => {
+            selectedClient = client;
+            return await new Promise<never>(() => undefined);
+        });
+        const operation = executeInMode(manager, mode, callback, { timeoutMs: 25 });
+        const rejection = expect(operation).rejects.toEqual(new OperationTimeoutError(1, 25));
+
+        await vi.advanceTimersByTimeAsync(25);
+
+        await rejection;
+        await expect(selectedClient?.getBlockNumber()).rejects.toThrow("RPC client attempt is no longer active");
+        expect(request).toHaveBeenCalledOnce();
+    });
+
     it.each(["retry", "once"] as const)("preserves abort reason during a %s callback", async (mode) => {
         vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) =>
             Promise.resolve(rpcResponse(init ?? {}))));
@@ -104,7 +130,7 @@ describe("RpcPoolManager operation entry points", () => {
             selectedClient = client;
             return await new Promise<never>(() => undefined);
         });
-        const operation = executeWithSignal(manager, mode, callback, controller.signal);
+        const operation = executeInMode(manager, mode, callback, { signal: controller.signal });
 
         await vi.waitFor(() => {
             expect(callback).toHaveBeenCalledOnce();
@@ -124,7 +150,7 @@ describe("RpcPoolManager operation entry points", () => {
         const callback = vi.fn(() => Promise.resolve());
         controller.abort(reason);
 
-        const operation = executeWithSignal(manager, mode, callback, controller.signal);
+        const operation = executeInMode(manager, mode, callback, { signal: controller.signal });
 
         await expect(operation).rejects.toBe(reason);
         expect(callback).not.toHaveBeenCalled();
@@ -151,7 +177,7 @@ describe("RpcPoolManager operation entry points", () => {
         const reason = new Error("request cancelled");
         const callback = vi.fn(async (client: RetryableRpcClient | SingleAttemptRpcClient) =>
             await client.getBlockNumber());
-        const operation = executeWithSignal(manager, mode, callback, controller.signal);
+        const operation = executeInMode(manager, mode, callback, { signal: controller.signal });
 
         await vi.waitFor(() => {
             expect(requestSignal).toBeDefined();
@@ -229,6 +255,17 @@ describe("RpcPoolManager operation entry points", () => {
         expect(request).toHaveBeenCalledOnce();
     });
 
+    it("deactivates a single-attempt client when its callback finishes", async () => {
+        const request = vi.fn((_input: string | URL | Request, init?: RequestInit) =>
+            Promise.resolve(rpcResponse(init ?? {})));
+        vi.stubGlobal("fetch", request);
+        const manager = new RpcPoolManager(config);
+        const client = await manager.executeOnce(1, (selected) => Promise.resolve(selected));
+
+        await expect(client.getBlockNumber()).rejects.toThrow("RPC client attempt is no longer active");
+        expect(request).toHaveBeenCalledOnce();
+    });
+
     it("restarts the whole callback on another endpoint after a retryable client failure", async () => {
         const calls = new Map<string, string[]>();
         vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
@@ -247,7 +284,9 @@ describe("RpcPoolManager operation entry points", () => {
             ...config,
             networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
         });
+        const clients: RetryableRpcClient[] = [];
         const callback = vi.fn(async (client: RetryableRpcClient): Promise<bigint[]> => {
+            clients.push(client);
             const first = await client.getBalance("0x0000000000000000000000000000000000000001");
             const second = await client.getBalance("0x0000000000000000000000000000000000000002");
             return [first, second];
@@ -255,6 +294,9 @@ describe("RpcPoolManager operation entry points", () => {
 
         await expect(manager.executeWithRetry(1, callback)).resolves.toEqual([1n, 1n]);
         expect(callback).toHaveBeenCalledTimes(2);
+        for (const client of clients) {
+            await expect(client.getBlockNumber()).rejects.toThrow("RPC client attempt is no longer active");
+        }
         expect(calls.get("https://first.example/")).toEqual(["eth_chainId", "eth_getBalance", "eth_getBalance"]);
         expect(calls.get("https://second.example/")).toEqual(["eth_chainId", "eth_getBalance", "eth_getBalance"]);
     });
