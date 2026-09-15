@@ -112,6 +112,57 @@ describe("RpcPoolManager operation entry points", () => {
         await rejection;
     });
 
+    it("shares one budget between chain verification and the callback", async () => {
+        vi.useFakeTimers();
+        vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) =>
+            new Promise<Response>((resolve) => {
+                setTimeout(() => {
+                    resolve(rpcResponse(init ?? {}));
+                }, 20);
+            })));
+        const manager = new RpcPoolManager(config);
+        const callback = vi.fn(async () => await new Promise<never>(() => undefined));
+        const operation = manager.executeWithRetry(1, callback, { timeoutMs: 30 });
+        const rejection = expect(operation).rejects.toEqual(new OperationTimeoutError(1, 30));
+
+        await vi.advanceTimersByTimeAsync(20);
+        expect(callback).toHaveBeenCalledOnce();
+        await vi.advanceTimersByTimeAsync(9);
+        expect(vi.getTimerCount()).toBeGreaterThan(0);
+        await vi.advanceTimersByTimeAsync(1);
+
+        await rejection;
+    });
+
+    it("keeps the original budget across retries and cooldown waiting", async () => {
+        vi.useFakeTimers();
+        const methods = new Map<string, string[]>();
+        vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
+            const endpoint = requestUrl(input);
+            const payload = JSON.parse(init?.body as string) as { id: number; method: string };
+            methods.set(endpoint, [...(methods.get(endpoint) ?? []), payload.method]);
+            if (payload.method === "eth_chainId") {
+                return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x1" }));
+            }
+            return Promise.reject(new TypeError("connection reset"));
+        }));
+        const manager = new RpcPoolManager({
+            ...config,
+            networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
+        });
+        const callback = vi.fn(async (client: RetryableRpcClient) => await client.getBlockNumber());
+        const operation = manager.executeWithRetry(1, callback, { timeoutMs: 40 });
+        const rejection = expect(operation).rejects.toEqual(new OperationTimeoutError(1, 40));
+
+        await vi.advanceTimersByTimeAsync(39);
+        expect(callback).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(1);
+
+        await rejection;
+        expect(methods.get("https://first.example/")).toEqual(["eth_chainId", "eth_blockNumber"]);
+        expect(methods.get("https://second.example/")).toEqual(["eth_chainId", "eth_blockNumber"]);
+    });
+
     it.each(["retry", "once"] as const)("deactivates the %s client when its callback times out", async (mode) => {
         vi.useFakeTimers();
         const request = vi.fn((_input: string | URL | Request, init?: RequestInit) =>
