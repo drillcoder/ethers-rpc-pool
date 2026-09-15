@@ -24,6 +24,7 @@ export interface EndpointJsonRpcProviderOptions {
 }
 
 export interface RpcTransportObserver {
+    onComplete(durationMs: number): void;
     onError(error: unknown): void;
     onRequest(method: string): void;
 }
@@ -116,11 +117,14 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
         }
 
         this.#observer?.onRequest(payload.method);
+        const startedAt = this.#runtime.monotonicNow();
         try {
             return await this.#requestPayload(payload, context, remainingMs);
         } catch (error: unknown) {
             this.#observer?.onError(error);
             throw error;
+        } finally {
+            this.#observer?.onComplete(this.#runtime.monotonicNow() - startedAt);
         }
     }
 

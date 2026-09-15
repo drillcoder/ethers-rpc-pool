@@ -42,6 +42,7 @@ describe("RPC counters", () => {
         const onError = vi.fn();
         const onRequest = vi.fn();
         const observer: RpcTransportObserver = {
+            onComplete: vi.fn(),
             onError,
             onRequest,
         };

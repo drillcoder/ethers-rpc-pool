@@ -71,6 +71,102 @@ describe("RpcPoolManager operation entry points", () => {
         expect(methods).toEqual(["eth_chainId", "eth_blockNumber"]);
     });
 
+    it("returns an immutable snapshot with counters, endpoint state, and masked identifiers", async () => {
+        vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
+            const payload = JSON.parse(init?.body as string) as { id: number; method: string };
+            if (payload.method === "eth_chainId") {
+                return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x1" }));
+            }
+            if (new URL(requestUrl(input)).hostname === "first.example") {
+                return Promise.resolve(Response.json(
+                    { id: payload.id, jsonrpc: "2.0", result: "unavailable" },
+                    { status: 503 },
+                ));
+            }
+            return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x2a" }));
+        }));
+        const manager = new RpcPoolManager({
+            ...config,
+            networks: [{
+                chainId: 1,
+                rpcUrls: [
+                    "https://user:password@first.example/secret/token?apiKey=value#fragment",
+                    "https://second.example/rpc",
+                ],
+            }],
+        });
+
+        await expect(manager.executeWithRetry(1, async (client) => await client.getBlockNumber())).resolves.toBe(42);
+        const snapshot = manager.getSnapshot();
+        const firstEndpoint = snapshot.networks[0]?.endpoints[0];
+        const secondEndpoint = snapshot.networks[0]?.endpoints[1];
+
+        expect(firstEndpoint?.cooldownUntil).toBeTypeOf("number");
+        expect(firstEndpoint?.latencyEwmaMs).toBeTypeOf("number");
+        expect(secondEndpoint?.latencyEwmaMs).toBeTypeOf("number");
+
+        expect(snapshot).toEqual({
+            closed: false,
+            errorsByCategory: { "http-5xx": 1 },
+            networks: [{
+                chainId: 1,
+                endpoints: [
+                    {
+                        activeGroups: 0,
+                        cooldownUntil: firstEndpoint?.cooldownUntil,
+                        endpointId: "https://first.example",
+                        endpointNumber: 1,
+                        errorCount: 1,
+                        excludedReason: null,
+                        latencyEwmaMs: firstEndpoint?.latencyEwmaMs,
+                        requestCount: 2,
+                        status: "cooling-down",
+                    },
+                    {
+                        activeGroups: 0,
+                        cooldownUntil: null,
+                        endpointId: "https://second.example",
+                        endpointNumber: 2,
+                        errorCount: 0,
+                        excludedReason: null,
+                        latencyEwmaMs: secondEndpoint?.latencyEwmaMs,
+                        requestCount: 2,
+                        status: "available",
+                    },
+                ],
+            }],
+            requestsByMethod: { eth_blockNumber: 2, eth_chainId: 2 },
+            totalActiveGroups: 0,
+            totalRequests: 4,
+        });
+        expect(Object.isFrozen(snapshot)).toBe(true);
+        expect(Object.isFrozen(snapshot.networks)).toBe(true);
+        expect(Object.isFrozen(snapshot.networks[0]?.endpoints)).toBe(true);
+        expect(() => {
+            (snapshot as { totalRequests: number }).totalRequests = 0;
+        }).toThrow(TypeError);
+        expect(manager.getSnapshot().totalRequests).toBe(4);
+    });
+
+    it("reports active groups while an operation is running", async () => {
+        vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) =>
+            Promise.resolve(rpcResponse(init ?? {}))));
+        const manager = new RpcPoolManager(config);
+        const callbackStarted = deferred<undefined>();
+        const callbackFinished = deferred<undefined>();
+        const operation = manager.executeOnce(1, async () => {
+            callbackStarted.resolve(undefined);
+            await callbackFinished.promise;
+        });
+        await callbackStarted.promise;
+
+        expect(manager.getSnapshot().totalActiveGroups).toBe(1);
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]?.activeGroups).toBe(1);
+
+        callbackFinished.resolve(undefined);
+        await operation;
+    });
+
     it("rejects an unknown network before invoking the callback", async () => {
         const callback = vi.fn(() => Promise.resolve());
         const manager = new RpcPoolManager(config);

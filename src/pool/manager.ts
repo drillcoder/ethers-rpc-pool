@@ -5,6 +5,7 @@ import {
     recordRpcError,
     recordRpcRequest,
 } from "../observability/counters.js";
+import type { RpcPoolSnapshot } from "../observability/types.js";
 import { EndpointChainIdVerifier, RpcChainIdMismatchError } from "../transport/chain-id.js";
 import { classifyRpcTransportError } from "../transport/classification.js";
 import { EndpointJsonRpcProvider } from "../transport/provider.js";
@@ -26,6 +27,7 @@ import {
     notifyNetworkStateChanged,
     reserveEndpoint,
     runEndpointReservation,
+    updateEndpointLatency,
     waitForEndpointAvailability,
 } from "./state.js";
 import type { EndpointFailureStreaks, EndpointState, NetworkState, PoolState } from "./state.js";
@@ -36,9 +38,44 @@ import type {
     SingleAttemptRpcClient,
 } from "./types.js";
 
-interface ManagedEndpoint extends EndpointState {
-    readonly provider: EndpointJsonRpcProvider;
-    readonly verifier: EndpointChainIdVerifier;
+class ManagedEndpoint implements EndpointState {
+    public activeGroups = 0;
+    public cooldownUntil: number | null = null;
+    public readonly counters = createEndpointCounters();
+    public excludedReason: EndpointState["excludedReason"] = null;
+    public readonly failureStreaks: EndpointFailureStreaks = { long: 0, short: 0 };
+    public latencyEwmaMs: number | null = null;
+    public probeToken: EndpointState["probeToken"] = null;
+    public readonly provider: EndpointJsonRpcProvider;
+    public status: EndpointState["status"] = "available";
+    public readonly verifier: EndpointChainIdVerifier;
+    public version = 0;
+
+    public constructor(
+        public readonly endpointNumber: number,
+        public readonly rpcUrl: string,
+        chainId: number,
+        requestTimeoutMs: number,
+        counters: PoolState["counters"],
+        runtime: RuntimeDependencies,
+    ) {
+        this.provider = new EndpointJsonRpcProvider(rpcUrl, chainId, {
+            observer: {
+                onComplete: (durationMs) => {
+                    updateEndpointLatency(this, durationMs);
+                },
+                onError: (error) => {
+                    const classification = classifyRpcTransportError(error, runtime.epochNow());
+                    recordRpcError(counters, this.counters, classification.category);
+                },
+                onRequest: (method) => {
+                    recordRpcRequest(counters, this.counters, method);
+                },
+            },
+            requestTimeoutMs,
+        });
+        this.verifier = new EndpointChainIdVerifier(this.provider, chainId);
+    }
 }
 
 interface RetryDecision {
@@ -104,37 +141,14 @@ export class RpcPoolManager {
         this.#state = {
             counters,
             networks: new Map(normalized.networks.map((network) => {
-                const endpoints = network.rpcUrls.map((rpcUrl, index): ManagedEndpoint => {
-                    const endpointCounters = createEndpointCounters();
-                    const provider = new EndpointJsonRpcProvider(rpcUrl, network.chainId, {
-                        observer: {
-                            onError: (error) => {
-                                const classification = classifyRpcTransportError(error, this.#runtime.epochNow());
-                                recordRpcError(counters, endpointCounters, classification.category);
-                            },
-                            onRequest: (method) => {
-                                recordRpcRequest(counters, endpointCounters, method);
-                            },
-                        },
-                        requestTimeoutMs: normalized.requestTimeoutMs,
-                    });
-                    const failureStreaks: EndpointFailureStreaks = { long: 0, short: 0 };
-                    return {
-                        activeGroups: 0,
-                        cooldownUntil: null,
-                        counters: endpointCounters,
-                        endpointNumber: index + 1,
-                        excludedReason: null,
-                        failureStreaks,
-                        latencyEwmaMs: null,
-                        probeToken: null,
-                        provider,
-                        rpcUrl,
-                        status: "available",
-                        verifier: new EndpointChainIdVerifier(provider, network.chainId),
-                        version: 0,
-                    };
-                });
+                const endpoints = network.rpcUrls.map((rpcUrl, index) => new ManagedEndpoint(
+                    index + 1,
+                    rpcUrl,
+                    network.chainId,
+                    normalized.requestTimeoutMs,
+                    counters,
+                    this.#runtime,
+                ));
                 const state: NetworkState<ManagedEndpoint> = {
                     activeGroups: 0,
                     chainId: network.chainId,
@@ -186,6 +200,41 @@ export class RpcPoolManager {
                 await this.#executeOnceAttempt(network, callback, options, timeoutMs, deadlineMs, termination),
             options.signal,
         );
+    }
+
+    public getSnapshot(): RpcPoolSnapshot {
+        const monotonicNow = this.#runtime.monotonicNow();
+        const epochNow = this.#runtime.epochNow();
+        const requestsByMethod = Object.freeze(Object.fromEntries(this.#state.counters.requestsByMethod));
+        const errorsByCategory = Object.freeze(Object.fromEntries(this.#state.counters.errorsByCategory));
+        const networks = [...this.#state.networks.values()].map((network) => Object.freeze({
+            chainId: network.chainId,
+            endpoints: Object.freeze(network.endpoints.map((endpoint) => Object.freeze({
+                activeGroups: endpoint.activeGroups,
+                cooldownUntil: endpoint.cooldownUntil === null
+                    ? null
+                    : epochNow + endpoint.cooldownUntil - monotonicNow,
+                endpointId: new URL(endpoint.rpcUrl).origin,
+                endpointNumber: endpoint.endpointNumber,
+                errorCount: endpoint.counters.errorCount,
+                excludedReason: endpoint.excludedReason,
+                latencyEwmaMs: endpoint.latencyEwmaMs,
+                requestCount: endpoint.counters.requestCount,
+                status: endpoint.status,
+            }))),
+        }));
+
+        return Object.freeze({
+            closed: false,
+            errorsByCategory,
+            networks: Object.freeze(networks),
+            requestsByMethod,
+            totalActiveGroups: [...this.#state.networks.values()].reduce(
+                (total, network) => total + network.activeGroups,
+                0,
+            ),
+            totalRequests: this.#state.counters.totalRequests,
+        });
     }
 
     async #executeOnceAttempt<Result>(
