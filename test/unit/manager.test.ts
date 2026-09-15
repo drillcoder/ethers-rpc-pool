@@ -25,6 +25,20 @@ function requestUrl(input: string | URL | Request): string {
     return typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
 }
 
+function deferred<Value>(): {
+    readonly promise: Promise<Value>;
+    readonly reject: (reason: unknown) => void;
+    readonly resolve: (value: Value) => void;
+} {
+    let reject!: (reason: unknown) => void;
+    let resolve!: (value: Value) => void;
+    const promise = new Promise<Value>((resolvePromise, rejectPromise) => {
+        reject = rejectPromise;
+        resolve = resolvePromise;
+    });
+    return { promise, reject, resolve };
+}
+
 function executeInMode<Result>(
     manager: RpcPoolManager,
     mode: "retry" | "once",
@@ -188,6 +202,81 @@ describe("RpcPoolManager operation entry points", () => {
         expect(requestSignal?.aborted).toBe(true);
         expect(requestSignal?.reason).toBe(reason);
         expect(callback).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+        ["retry", "resolve"],
+        ["retry", "reject"],
+        ["once", "resolve"],
+        ["once", "reject"],
+    ] as const)("absorbs a late %s mode callback %s", async (mode, settlement) => {
+        vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) =>
+            Promise.resolve(rpcResponse(init ?? {}))));
+        const manager = new RpcPoolManager(config);
+        const controller = new AbortController();
+        const reason = new Error("cancelled");
+        const late = deferred<string>();
+        const callback = vi.fn(() => late.promise);
+        const operation = executeInMode(manager, mode, callback, { signal: controller.signal });
+
+        await vi.waitFor(() => {
+            expect(callback).toHaveBeenCalledOnce();
+        });
+        controller.abort(reason);
+        await expect(operation).rejects.toBe(reason);
+
+        if (settlement === "resolve") {
+            late.resolve("too late");
+        } else {
+            late.reject(new RpcEndpointDataError("too late"));
+        }
+        await Promise.resolve();
+
+        await expect(manager.executeOnce(1, () => Promise.resolve("available"))).resolves.toBe("available");
+    });
+
+    it.each(["retry", "once"] as const)("absorbs a late callback rejection after %s timeout", async (mode) => {
+        vi.useFakeTimers();
+        vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) =>
+            Promise.resolve(rpcResponse(init ?? {}))));
+        const manager = new RpcPoolManager(config);
+        const late = deferred<string>();
+        const callback = vi.fn(() => late.promise);
+        const operation = executeInMode(manager, mode, callback, { timeoutMs: 25 });
+        const rejection = expect(operation).rejects.toEqual(new OperationTimeoutError(1, 25));
+
+        await vi.advanceTimersByTimeAsync(25);
+        await rejection;
+        late.reject(new RpcEndpointDataError("too late"));
+        await Promise.resolve();
+
+        await expect(manager.executeOnce(1, () => Promise.resolve("available"))).resolves.toBe("available");
+    });
+
+    it.each(["retry", "once"] as const)("absorbs a late transport rejection in %s mode", async (mode) => {
+        const late = deferred<Response>();
+        vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+            const payload = JSON.parse(init?.body as string) as { id: number; method: string };
+            return payload.method === "eth_chainId"
+                ? Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x1" }))
+                : late.promise;
+        }));
+        const manager = new RpcPoolManager(config);
+        const controller = new AbortController();
+        const reason = new Error("cancelled");
+        const callback = vi.fn(async (client: RetryableRpcClient | SingleAttemptRpcClient) =>
+            await client.getBlockNumber());
+        const operation = executeInMode(manager, mode, callback, { signal: controller.signal });
+
+        await vi.waitFor(() => {
+            expect(callback).toHaveBeenCalledOnce();
+        });
+        controller.abort(reason);
+        await expect(operation).rejects.toBe(reason);
+        late.reject(new TypeError("late connection failure"));
+        await Promise.resolve();
+
+        await expect(manager.executeOnce(1, () => Promise.resolve("available"))).resolves.toBe("available");
     });
 
     it("rejects an invalid local timeout before invoking the callback", async () => {
