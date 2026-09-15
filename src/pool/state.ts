@@ -208,7 +208,9 @@ export function waitForEndpointAvailability(
             }
         };
         const abort = (): void => {
-            settle(options.signal?.reason ?? new DOMException("The operation was aborted", "AbortError"));
+            if (options.signal !== undefined) {
+                settle(options.signal.reason);
+            }
         };
         function evaluate(): void {
             if (timer !== null) {

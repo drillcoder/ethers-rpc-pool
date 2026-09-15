@@ -22,6 +22,11 @@ export interface EndpointJsonRpcProviderOptions {
     readonly runtime?: Partial<RuntimeDependencies>;
 }
 
+interface RequestContext {
+    readonly deadlineMs: number;
+    readonly signal?: AbortSignal;
+}
+
 export class RpcTransportResponseError extends Error {
     public override readonly name = "RpcTransportResponseError";
     public readonly headers: Readonly<Record<string, string>>;
@@ -52,7 +57,7 @@ export class RpcRequestTimeoutError extends Error {
 }
 
 export class EndpointJsonRpcProvider extends JsonRpcProvider {
-    readonly #deadline = new AsyncLocalStorage<number>();
+    readonly #context = new AsyncLocalStorage<RequestContext>();
     readonly #request: HttpRequest;
     readonly #requestTimeoutMs: number;
     readonly #runtime: RuntimeDependencies;
@@ -74,8 +79,13 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
         this.#runtime = createRuntime(options.runtime);
     }
 
-    public runWithDeadline<Result>(deadlineMs: number, operation: () => Promise<Result>): Promise<Result> {
-        return this.#deadline.run(deadlineMs, operation);
+    public runWithDeadline<Result>(
+        deadlineMs: number,
+        operation: () => Promise<Result>,
+        signal?: AbortSignal,
+    ): Promise<Result> {
+        const context = signal === undefined ? { deadlineMs } : { deadlineMs, signal };
+        return this.#context.run(context, operation);
     }
 
     public override async _send(payload: JsonRpcPayload | JsonRpcPayload[]): Promise<JsonRpcResult[]> {
@@ -87,7 +97,8 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
     }
 
     async #sendOne(payload: JsonRpcPayload): Promise<JsonRpcResult> {
-        const deadlineMs = this.#deadline.getStore();
+        const context = this.#context.getStore();
+        const deadlineMs = context?.deadlineMs;
         const remainingMs =
             deadlineMs === undefined
                 ? Number.POSITIVE_INFINITY
@@ -98,6 +109,14 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
 
         const timeoutMs = Math.min(this.#requestTimeoutMs, remainingMs);
         const controller = new AbortController();
+        const abort = (): void => {
+            controller.abort(context?.signal?.reason);
+        };
+        if (context?.signal?.aborted === true) {
+            abort();
+        } else {
+            context?.signal?.addEventListener("abort", abort, { once: true });
+        }
         const timeout = this.#runtime.setTimeout(() => {
             controller.abort(new RpcRequestTimeoutError(timeoutMs));
         }, timeoutMs);
@@ -140,6 +159,7 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
 
             return body as JsonRpcResult;
         } finally {
+            context?.signal?.removeEventListener("abort", abort);
             this.#runtime.clearTimeout(timeout);
         }
     }

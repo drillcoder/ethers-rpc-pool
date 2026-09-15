@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { NoUsableRpcEndpointError, OperationTimeoutError } from "../../src/errors/errors.js";
+import { NoUsableRpcEndpointError, OperationTimeoutError } from "../../src/index.js";
 import { createRuntime } from "../../src/pool/runtime.js";
 import {
     createPoolState,
@@ -119,18 +119,15 @@ describe("waitForEndpointAvailability", () => {
         expect(vi.getTimerCount()).toBe(0);
     });
 
-    it("uses a standard abort error for a pre-aborted signal without a reason", async () => {
+    it("preserves the standard reason of a pre-aborted signal", async () => {
         vi.useFakeTimers();
         const network = createNetwork();
-        const signal = {
-            aborted: true,
-            addEventListener: vi.fn(),
-            removeEventListener: vi.fn(),
-        } as unknown as AbortSignal;
+        const controller = new AbortController();
+        controller.abort();
 
-        const waiting = waitForEndpointAvailability(network, createWaitOptions(500, signal));
+        const waiting = waitForEndpointAvailability(network, createWaitOptions(500, controller.signal));
 
-        await expect(waiting).rejects.toMatchObject({ name: "AbortError" });
+        await expect(waiting).rejects.toBe(controller.signal.reason);
         expect(vi.getTimerCount()).toBe(0);
     });
 
