@@ -1,4 +1,10 @@
 import { OperationTimeoutError, RpcEndpointDataError, UnknownNetworkError } from "../errors/errors.js";
+import {
+    createEndpointCounters,
+    createRpcCounters,
+    recordRpcError,
+    recordRpcRequest,
+} from "../observability/counters.js";
 import { EndpointChainIdVerifier, RpcChainIdMismatchError } from "../transport/chain-id.js";
 import { classifyRpcTransportError } from "../transport/classification.js";
 import { EndpointJsonRpcProvider } from "../transport/provider.js";
@@ -94,16 +100,29 @@ export class RpcPoolManager {
         const normalized = normalizeManagerConfig(config);
         this.#operationTimeoutMs = normalized.operationTimeoutMs;
         this.#runtime = createRuntime();
+        const counters = createRpcCounters();
         this.#state = {
+            counters,
             networks: new Map(normalized.networks.map((network) => {
                 const endpoints = network.rpcUrls.map((rpcUrl, index): ManagedEndpoint => {
+                    const endpointCounters = createEndpointCounters();
                     const provider = new EndpointJsonRpcProvider(rpcUrl, network.chainId, {
+                        observer: {
+                            onError: (error) => {
+                                const classification = classifyRpcTransportError(error, this.#runtime.epochNow());
+                                recordRpcError(counters, endpointCounters, classification.category);
+                            },
+                            onRequest: (method) => {
+                                recordRpcRequest(counters, endpointCounters, method);
+                            },
+                        },
                         requestTimeoutMs: normalized.requestTimeoutMs,
                     });
                     const failureStreaks: EndpointFailureStreaks = { long: 0, short: 0 };
                     return {
                         activeGroups: 0,
                         cooldownUntil: null,
+                        counters: endpointCounters,
                         endpointNumber: index + 1,
                         excludedReason: null,
                         failureStreaks,
@@ -274,6 +293,7 @@ export class RpcPoolManager {
             return { error, retry: true };
         }
         if (error instanceof RpcEndpointDataError) {
+            recordRpcError(this.#state.counters, endpoint.counters, "endpoint-data");
             applyEndpointDataCooldown(endpoint, this.#runtime.monotonicNow(), this.#runtime);
             return { error, retry: true };
         }
@@ -294,6 +314,7 @@ export class RpcPoolManager {
             return { error, retry: false };
         }
         if (error instanceof RpcEndpointDataError) {
+            recordRpcError(this.#state.counters, endpoint.counters, "endpoint-data");
             applyEndpointDataCooldown(endpoint, this.#runtime.monotonicNow(), this.#runtime);
             return { error, retry: false };
         }

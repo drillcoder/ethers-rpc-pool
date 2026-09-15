@@ -1,4 +1,6 @@
 import { NoUsableRpcEndpointError, OperationTimeoutError } from "../errors/errors.js";
+import type { EndpointCounters, RpcCounters } from "../observability/counters.js";
+import { createEndpointCounters, createRpcCounters } from "../observability/counters.js";
 import type { RpcEndpointExcludedReason, RpcEndpointStatus } from "../observability/types.js";
 import type { RuntimeDependencies, TimerHandle } from "./runtime.js";
 import type { RpcNetworkConfig } from "./types.js";
@@ -14,6 +16,7 @@ export interface EndpointFailureStreaks {
 export type EndpointProbeToken = symbol;
 
 export interface EndpointState {
+    readonly counters: EndpointCounters;
     readonly endpointNumber: number;
     readonly rpcUrl: string;
     activeGroups: number;
@@ -34,6 +37,7 @@ export interface NetworkState<Endpoint extends EndpointState = EndpointState> {
 }
 
 export interface PoolState<Endpoint extends EndpointState = EndpointState> {
+    readonly counters: RpcCounters;
     readonly networks: ReadonlyMap<number, NetworkState<Endpoint>>;
 }
 
@@ -59,6 +63,7 @@ export interface EndpointAvailabilityWaitOptions {
 
 function createEndpointState(rpcUrl: string, endpointNumber: number): EndpointState {
     return {
+        counters: createEndpointCounters(),
         endpointNumber,
         rpcUrl,
         activeGroups: 0,
@@ -77,6 +82,7 @@ function createEndpointState(rpcUrl: string, endpointNumber: number): EndpointSt
 
 export function createPoolState(networks: readonly RpcNetworkConfig[]): PoolState {
     return {
+        counters: createRpcCounters(),
         networks: new Map(
             networks.map((network) => [
                 network.chainId,

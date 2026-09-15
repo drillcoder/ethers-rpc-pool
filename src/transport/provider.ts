@@ -18,8 +18,14 @@ export type HttpRequest = (
 
 export interface EndpointJsonRpcProviderOptions {
     readonly requestTimeoutMs: number;
+    readonly observer?: RpcTransportObserver;
     readonly request?: HttpRequest;
     readonly runtime?: Partial<RuntimeDependencies>;
+}
+
+export interface RpcTransportObserver {
+    onError(error: unknown): void;
+    onRequest(method: string): void;
 }
 
 interface RequestContext {
@@ -58,6 +64,7 @@ export class RpcRequestTimeoutError extends Error {
 
 export class EndpointJsonRpcProvider extends JsonRpcProvider {
     readonly #context = new AsyncLocalStorage<RequestContext>();
+    readonly #observer: RpcTransportObserver | undefined;
     readonly #request: HttpRequest;
     readonly #requestTimeoutMs: number;
     readonly #runtime: RuntimeDependencies;
@@ -74,6 +81,7 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
         });
 
         this.#url = url;
+        this.#observer = options.observer;
         this.#request = options.request ?? globalThis.fetch;
         this.#requestTimeoutMs = options.requestTimeoutMs;
         this.#runtime = createRuntime(options.runtime);
@@ -107,6 +115,20 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
             throw new RpcRequestTimeoutError(0);
         }
 
+        this.#observer?.onRequest(payload.method);
+        try {
+            return await this.#requestPayload(payload, context, remainingMs);
+        } catch (error: unknown) {
+            this.#observer?.onError(error);
+            throw error;
+        }
+    }
+
+    async #requestPayload(
+        payload: JsonRpcPayload,
+        context: RequestContext | undefined,
+        remainingMs: number,
+    ): Promise<JsonRpcResult> {
         const timeoutMs = Math.min(this.#requestTimeoutMs, remainingMs);
         const controller = new AbortController();
         const abort = (): void => {

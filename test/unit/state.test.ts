@@ -22,12 +22,18 @@ describe("createPoolState", () => {
         const state = createPoolState(networks);
 
         expect([...state.networks.keys()]).toEqual([1, 10]);
+        expect(state.counters).toEqual({
+            errorsByCategory: new Map(),
+            requestsByMethod: new Map(),
+            totalRequests: 0,
+        });
         expect(state.networks.get(1)).toEqual({
             chainId: 1,
             activeGroups: 0,
             selectionCursor: 0,
             endpoints: [
                 {
+                    counters: { errorCount: 0, requestCount: 0 },
                     endpointNumber: 1,
                     rpcUrl: "https://first.example/",
                     activeGroups: 0,
@@ -40,6 +46,7 @@ describe("createPoolState", () => {
                     version: 0,
                 },
                 {
+                    counters: { errorCount: 0, requestCount: 0 },
                     endpointNumber: 2,
                     rpcUrl: "https://second.example/",
                     activeGroups: 0,
