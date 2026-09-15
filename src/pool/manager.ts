@@ -5,6 +5,7 @@ import { normalizeManagerConfig } from "./config.js";
 import { createRetryableRpcAttempt } from "./retryable-client.js";
 import { createRuntime } from "./runtime.js";
 import type { RuntimeDependencies, TimerHandle } from "./runtime.js";
+import { createSingleRpcAttempt } from "./single-attempt-client.js";
 import {
     reserveEndpoint,
     runEndpointReservation,
@@ -113,7 +114,18 @@ export class RpcPoolManager {
         callback: (client: SingleAttemptRpcClient) => Promise<Result>,
         options: RpcExecutionOptions = {},
     ): Promise<Result> {
-        return await this.#execute(chainId, callback, options);
+        return await this.#execute(
+            chainId,
+            async (provider) => {
+                const attempt = createSingleRpcAttempt(provider);
+                try {
+                    return await callback(attempt.client);
+                } finally {
+                    await attempt.deactivate();
+                }
+            },
+            options,
+        );
     }
 
     async #execute<Result>(
