@@ -2,6 +2,7 @@ import { Block, Log, TransactionReceipt, TransactionResponse } from "ethers";
 import type { Provider } from "ethers";
 
 import type { EndpointJsonRpcProvider } from "../transport/provider.js";
+import { EndpointReservationUnavailableError } from "./attempt.js";
 import type { RetryableRpcClient } from "./types.js";
 
 export interface RetryableRpcAttempt {
@@ -17,7 +18,10 @@ export class RetryableRpcCallError extends Error {
     }
 }
 
-export function createRetryableRpcAttempt(provider: EndpointJsonRpcProvider): RetryableRpcAttempt {
+export function createRetryableRpcAttempt(
+    provider: EndpointJsonRpcProvider,
+    isEndpointAvailable: () => boolean = () => true,
+): RetryableRpcAttempt {
     let active = true;
 
     const assertActive = (): void => {
@@ -27,6 +31,9 @@ export function createRetryableRpcAttempt(provider: EndpointJsonRpcProvider): Re
     };
     const runCall = async <Result>(operation: () => Promise<Result>): Promise<Result> => {
         assertActive();
+        if (!isEndpointAvailable()) {
+            throw new EndpointReservationUnavailableError();
+        }
         try {
             return await operation();
         } catch (cause: unknown) {

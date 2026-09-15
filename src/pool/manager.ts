@@ -3,6 +3,7 @@ import { EndpointChainIdVerifier, RpcChainIdMismatchError } from "../transport/c
 import { classifyRpcTransportError } from "../transport/classification.js";
 import { EndpointJsonRpcProvider } from "../transport/provider.js";
 import { normalizeManagerConfig } from "./config.js";
+import { EndpointReservationUnavailableError } from "./attempt.js";
 import {
     applyEndpointDataCooldown,
     applyLongCooldown,
@@ -15,6 +16,7 @@ import { createRuntime } from "./runtime.js";
 import type { RuntimeDependencies, TimerHandle } from "./runtime.js";
 import { createSingleRpcAttempt, SingleRpcCallError } from "./single-attempt-client.js";
 import {
+    isEndpointReservationCurrent,
     notifyNetworkStateChanged,
     reserveEndpoint,
     runEndpointReservation,
@@ -163,7 +165,10 @@ export class RpcPoolManager {
                 async () => await endpoint.provider.runWithDeadline(deadlineMs, async () => {
                     await endpoint.verifier.verify();
                     callbackStarted = true;
-                    const attempt = createSingleRpcAttempt(endpoint.provider);
+                    const attempt = createSingleRpcAttempt(
+                        endpoint.provider,
+                        () => isEndpointReservationCurrent(reservation),
+                    );
                     try {
                         return await callback(attempt.client);
                     } finally {
@@ -204,7 +209,10 @@ export class RpcPoolManager {
                 async () => await endpoint.provider.runWithDeadline(deadlineMs, async () => {
                     await endpoint.verifier.verify();
                     callbackStarted = true;
-                    const attempt = createRetryableRpcAttempt(endpoint.provider);
+                    const attempt = createRetryableRpcAttempt(
+                        endpoint.provider,
+                        () => isEndpointReservationCurrent(reservation),
+                    );
                     try {
                         return await callback(attempt.client);
                     } finally {
@@ -224,6 +232,9 @@ export class RpcPoolManager {
     }
 
     #handleRetryFailure(endpoint: ManagedEndpoint, error: unknown, callbackStarted: boolean): RetryDecision {
+        if (error instanceof EndpointReservationUnavailableError) {
+            return { error, retry: true };
+        }
         if (error instanceof RpcEndpointDataError) {
             applyEndpointDataCooldown(endpoint, this.#runtime.monotonicNow(), this.#runtime);
             return { error, retry: true };
@@ -241,6 +252,9 @@ export class RpcPoolManager {
     }
 
     #handleSingleFailure(endpoint: ManagedEndpoint, error: unknown, callbackStarted: boolean): RetryDecision {
+        if (error instanceof EndpointReservationUnavailableError) {
+            return { error, retry: false };
+        }
         if (error instanceof RpcEndpointDataError) {
             applyEndpointDataCooldown(endpoint, this.#runtime.monotonicNow(), this.#runtime);
             return { error, retry: false };

@@ -21,6 +21,7 @@ function requestUrl(input: string | URL | Request): string {
 
 describe("RpcPoolManager operation entry points", () => {
     afterEach(() => {
+        vi.restoreAllMocks();
         vi.unstubAllGlobals();
         vi.useRealTimers();
     });
@@ -234,5 +235,39 @@ describe("RpcPoolManager operation entry points", () => {
             "https://second.example/",
             "https://second.example/",
         ]);
+    });
+
+    it("rejects an obsolete single-attempt call without transport or callback restart", async () => {
+        const methods: string[] = [];
+        vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+            const payload = JSON.parse(init?.body as string) as { id: number; method: string };
+            methods.push(payload.method);
+            return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x1" }));
+        }));
+        const manager = new RpcPoolManager(config);
+        let resumeFirst: (() => void) | undefined;
+        let reportFirstCall: (() => void) | undefined;
+        const firstCall = new Promise<void>((resolve) => {
+            reportFirstCall = resolve;
+        });
+        const pause = new Promise<void>((resolve) => {
+            resumeFirst = resolve;
+        });
+        const callback = vi.fn<(client: SingleAttemptRpcClient) => Promise<void>>(async (client) => {
+            await client.send("debug_first", []);
+            reportFirstCall?.();
+            await pause;
+            await client.send("debug_second", []);
+        });
+        const operation = manager.executeOnce(1, callback);
+
+        await firstCall;
+        await expect(manager.executeOnce(1, () => Promise.reject(new RpcEndpointDataError()))).rejects
+            .toBeInstanceOf(RpcEndpointDataError);
+        resumeFirst?.();
+
+        await expect(operation).rejects.toThrow("Reserved RPC endpoint is no longer available");
+        expect(callback).toHaveBeenCalledOnce();
+        expect(methods).toEqual(["eth_chainId", "debug_first"]);
     });
 });

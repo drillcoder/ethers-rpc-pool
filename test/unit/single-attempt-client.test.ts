@@ -2,6 +2,7 @@ import { JsonRpcProvider, Wallet } from "ethers";
 import { describe, expect, it, vi } from "vitest";
 
 import { createSingleRpcAttempt, SingleRpcCallError } from "../../src/pool/single-attempt-client.js";
+import { EndpointReservationUnavailableError } from "../../src/pool/attempt.js";
 import { EndpointJsonRpcProvider } from "../../src/transport/provider.js";
 
 function createProvider(): EndpointJsonRpcProvider {
@@ -37,6 +38,16 @@ describe("createSingleRpcAttempt", () => {
         await expect(attempt.client.send("debug_custom", [])).rejects.toThrow(
             "RPC client attempt is no longer active",
         );
+        provider.destroy();
+    });
+
+    it("rejects a call before transport when its endpoint reservation is stale", async () => {
+        const provider = createProvider();
+        const send = vi.spyOn(provider, "send");
+        const { client } = createSingleRpcAttempt(provider, () => false);
+
+        await expect(client.send("debug_custom", [])).rejects.toBeInstanceOf(EndpointReservationUnavailableError);
+        expect(send).not.toHaveBeenCalled();
         provider.destroy();
     });
 

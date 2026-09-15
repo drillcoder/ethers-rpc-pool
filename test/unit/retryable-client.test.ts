@@ -2,6 +2,7 @@ import { Block, FeeData, Log, Network, Signature, TransactionReceipt, Transactio
 import { describe, expect, it, vi } from "vitest";
 
 import { createRetryableRpcAttempt } from "../../src/pool/retryable-client.js";
+import { EndpointReservationUnavailableError } from "../../src/pool/attempt.js";
 import { EndpointJsonRpcProvider } from "../../src/transport/provider.js";
 
 const methodNames = [
@@ -47,6 +48,16 @@ describe("createRetryableRpcAttempt", () => {
             "RPC client attempt is no longer active",
         );
         expect(getBalance).toHaveBeenCalledOnce();
+        provider.destroy();
+    });
+
+    it("rejects a call before transport when its endpoint reservation is stale", async () => {
+        const provider = createProvider();
+        const getBlockNumber = vi.spyOn(provider, "getBlockNumber");
+        const { client } = createRetryableRpcAttempt(provider, () => false);
+
+        await expect(client.getBlockNumber()).rejects.toBeInstanceOf(EndpointReservationUnavailableError);
+        expect(getBlockNumber).not.toHaveBeenCalled();
         provider.destroy();
     });
 

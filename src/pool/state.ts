@@ -165,6 +165,16 @@ export function reserveEndpoint<Endpoint extends EndpointState>(
     return { ...selected, probeToken, version: selected.endpoint.version };
 }
 
+export function isEndpointReservationCurrent(reservation: EndpointReservation): boolean {
+    if (reservation.endpoint.version !== reservation.version) {
+        return false;
+    }
+
+    return reservation.probeToken === null
+        ? reservation.endpoint.status === "available"
+        : reservation.endpoint.status === "probe" && reservation.endpoint.probeToken === reservation.probeToken;
+}
+
 export function notifyNetworkStateChanged(network: NetworkState): void {
     for (const listener of networkStateListeners.get(network) ?? []) {
         listener();

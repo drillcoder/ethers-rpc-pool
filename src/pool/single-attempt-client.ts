@@ -1,6 +1,7 @@
 import type { Listener, ProviderEvent } from "ethers";
 
 import type { EndpointJsonRpcProvider } from "../transport/provider.js";
+import { EndpointReservationUnavailableError } from "./attempt.js";
 import type { SingleAttemptRpcClient } from "./types.js";
 
 interface FacadeListener {
@@ -21,7 +22,10 @@ export class SingleRpcCallError extends Error {
     }
 }
 
-export function createSingleRpcAttempt(provider: EndpointJsonRpcProvider): SingleRpcAttempt {
+export function createSingleRpcAttempt(
+    provider: EndpointJsonRpcProvider,
+    isEndpointAvailable: () => boolean = () => true,
+): SingleRpcAttempt {
     let active = true;
     const listeners: FacadeListener[] = [];
     let cleanup: Promise<void> | undefined;
@@ -99,6 +103,9 @@ export function createSingleRpcAttempt(provider: EndpointJsonRpcProvider): Singl
             return (...args: unknown[]): unknown => {
                 if (!active) {
                     return Promise.reject(new Error("RPC client attempt is no longer active"));
+                }
+                if (!isEndpointAvailable()) {
+                    return Promise.reject(new EndpointReservationUnavailableError());
                 }
                 let result: unknown;
                 try {

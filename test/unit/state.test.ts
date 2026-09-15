@@ -4,6 +4,7 @@ import { applyShortCooldown, excludeEndpointForAuthorization } from "../../src/p
 import {
     createPoolState,
     getEndpointCandidates,
+    isEndpointReservationCurrent,
     reserveEndpoint,
     runEndpointReservation,
     runMeasuredEndpointCall,
@@ -184,6 +185,23 @@ describe("reserveEndpoint", () => {
 
         expect(reserveEndpoint(network, 0)).toBeNull();
         expect(network.activeGroups).toBe(0);
+    });
+
+    it("recognizes current normal and probe reservations and rejects stale versions or tokens", () => {
+        const network = createNetwork();
+        const reservation = reserveEndpoint(network, 0);
+        if (reservation === null) {
+            throw new Error("Expected endpoint reservation");
+        }
+
+        expect(isEndpointReservationCurrent(reservation)).toBe(true);
+        reservation.endpoint.version += 1;
+        expect(isEndpointReservationCurrent(reservation)).toBe(false);
+
+        const probe = reserveExpiredProbe();
+        expect(isEndpointReservationCurrent(probe.reservation)).toBe(true);
+        probe.endpoint.probeToken = Symbol("new-probe");
+        expect(isEndpointReservationCurrent(probe.reservation)).toBe(false);
     });
 });
 
