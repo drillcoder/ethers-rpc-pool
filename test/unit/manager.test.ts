@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OperationTimeoutError, RpcEndpointDataError, RpcPoolManager, UnknownNetworkError } from "../../src/index.js";
+import { RpcTransportResponseError } from "../../src/transport/provider.js";
 import type { RetryableRpcClient, RpcPoolManagerConfig, SingleAttemptRpcClient } from "../../src/index.js";
 
 const config: RpcPoolManagerConfig = {
@@ -98,6 +99,41 @@ describe("RpcPoolManager operation entry points", () => {
         const failure = new Error("callback failed");
 
         await expect(manager.executeOnce(1, () => Promise.reject(failure))).rejects.toBe(failure);
+    });
+
+    it.each([
+        ["invalid parameters", -32_602, "invalid params"],
+        ["unsupported methods", -32_601, "method not found"],
+        ["contract execution", 3, "execution reverted"],
+    ])("passes through %s failures without retry or cooldown", async (_category, code, message) => {
+        for (const mode of ["retry", "once"] as const) {
+            const methods: string[] = [];
+            const request = vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+                const payload = JSON.parse(init?.body as string) as { id: number; method: string };
+                methods.push(payload.method);
+                if (payload.method === "eth_chainId") {
+                    return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x1" }));
+                }
+                return Promise.resolve(Response.json({
+                    error: { code, message },
+                    id: payload.id,
+                    jsonrpc: "2.0",
+                }));
+            });
+            vi.stubGlobal("fetch", request);
+            const manager = new RpcPoolManager(config);
+            const callback = vi.fn(async (client: RetryableRpcClient | SingleAttemptRpcClient) =>
+                await client.getBlockNumber());
+            const failure = await (mode === "retry"
+                ? manager.executeWithRetry(1, callback)
+                : manager.executeOnce(1, callback)
+            ).catch((error: unknown) => error);
+            expect(failure).toBeInstanceOf(RpcTransportResponseError);
+            expect(failure).toMatchObject({ jsonRpcError: { code, message }, status: 200 });
+            expect(callback).toHaveBeenCalledOnce();
+            expect(methods).toEqual(["eth_chainId", "eth_blockNumber"]);
+            await expect(manager.executeOnce(1, () => Promise.resolve("available"))).resolves.toBe("available");
+        }
     });
 
     it("deactivates a retryable client when its callback finishes", async () => {
