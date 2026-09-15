@@ -86,3 +86,14 @@ export function excludeEndpointForAuthorization(endpoint: EndpointState): void {
     endpoint.status = "excluded";
     endpoint.version += 1;
 }
+
+export function excludeEndpointForChainIdMismatch(endpoint: EndpointState): void {
+    if (endpoint.status === "excluded") {
+        return;
+    }
+
+    endpoint.cooldownUntil = null;
+    endpoint.excludedReason = "chain-id-mismatch";
+    endpoint.status = "excluded";
+    endpoint.version += 1;
+}

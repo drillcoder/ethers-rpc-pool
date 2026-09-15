@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { OperationTimeoutError, RpcPoolManager, UnknownNetworkError } from "../../src/index.js";
-import type { RpcPoolManagerConfig } from "../../src/index.js";
+import { OperationTimeoutError, RpcEndpointDataError, RpcPoolManager, UnknownNetworkError } from "../../src/index.js";
+import type { RetryableRpcClient, RpcPoolManagerConfig } from "../../src/index.js";
 
 const config: RpcPoolManagerConfig = {
     networks: [{ chainId: 1, rpcUrls: ["https://rpc.example"] }],
@@ -104,5 +104,54 @@ describe("RpcPoolManager operation entry points", () => {
 
         await expect(client.getBlockNumber()).rejects.toThrow("RPC client attempt is no longer active");
         expect(request).toHaveBeenCalledOnce();
+    });
+
+    it("restarts the whole callback on another endpoint after a retryable client failure", async () => {
+        const calls = new Map<string, string[]>();
+        vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
+            const endpoint = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+            const payload = JSON.parse(init?.body as string) as { id: number; method: string };
+            const methods = calls.get(endpoint) ?? [];
+            methods.push(payload.method);
+            calls.set(endpoint, methods);
+            if (endpoint.includes("first") && methods.length === 3) {
+                return Promise.reject(new TypeError("connection reset"));
+            }
+            const result = payload.method === "eth_chainId" ? "0x1" : "0x1";
+            return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result }));
+        }));
+        const manager = new RpcPoolManager({
+            ...config,
+            networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
+        });
+        const callback = vi.fn<(client: RetryableRpcClient) => Promise<bigint[]>>(async (client) => [
+            await client.getBalance("0x0000000000000000000000000000000000000001"),
+            await client.getBalance("0x0000000000000000000000000000000000000002"),
+        ]);
+
+        await expect(manager.executeWithRetry(1, callback)).resolves.toEqual([1n, 1n]);
+        expect(callback).toHaveBeenCalledTimes(2);
+        expect(calls.get("https://first.example/")).toEqual(["eth_chainId", "eth_getBalance", "eth_getBalance"]);
+        expect(calls.get("https://second.example/")).toEqual(["eth_chainId", "eth_getBalance", "eth_getBalance"]);
+    });
+
+    it("retries the callback after RpcEndpointDataError but passes through an arbitrary callback error", async () => {
+        vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) =>
+            Promise.resolve(rpcResponse(init ?? {}))));
+        const manager = new RpcPoolManager({
+            ...config,
+            networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
+        });
+        const dataCallback = vi.fn()
+            .mockRejectedValueOnce(new RpcEndpointDataError("inconsistent response"))
+            .mockResolvedValueOnce("valid response");
+
+        await expect(manager.executeWithRetry(1, dataCallback)).resolves.toBe("valid response");
+        expect(dataCallback).toHaveBeenCalledTimes(2);
+
+        const failure = new Error("domain failure");
+        const domainCallback = vi.fn(() => Promise.reject(failure));
+        await expect(manager.executeWithRetry(1, domainCallback)).rejects.toBe(failure);
+        expect(domainCallback).toHaveBeenCalledOnce();
     });
 });

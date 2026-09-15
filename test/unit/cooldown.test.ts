@@ -5,6 +5,7 @@ import {
     applyLongCooldown,
     applyShortCooldown,
     excludeEndpointForAuthorization,
+    excludeEndpointForChainIdMismatch,
 } from "../../src/pool/cooldown.js";
 import { createPoolState, getEndpointCandidates } from "../../src/pool/state.js";
 import type { EndpointState } from "../../src/pool/state.js";
@@ -91,6 +92,20 @@ describe("authorization and endpoint-data failures", () => {
         expect(endpoint.excludedReason).toBe("authorization");
         expect(endpoint.cooldownUntil).toBeNull();
         expect(getEndpointCandidates(network, Infinity)).toEqual([]);
+    });
+
+    it("permanently excludes a mismatched-chain endpoint without a recovery deadline", () => {
+        const endpoint = createEndpoint();
+
+        endpoint.cooldownUntil = 10_000;
+        excludeEndpointForChainIdMismatch(endpoint);
+
+        expect(endpoint.status).toBe("excluded");
+        expect(endpoint.excludedReason).toBe("chain-id-mismatch");
+        expect(endpoint.cooldownUntil).toBeNull();
+        expect(endpoint.version).toBe(1);
+        excludeEndpointForChainIdMismatch(endpoint);
+        expect(endpoint.version).toBe(1);
     });
 
     it("uses a fixed five-second endpoint-data cooldown without changing failure streaks", () => {
