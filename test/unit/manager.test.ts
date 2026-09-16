@@ -570,6 +570,89 @@ describe("RpcPoolManager operation entry points", () => {
         expect(methods.get("https://second.example/")).toEqual(["eth_chainId", "eth_blockNumber"]);
     });
 
+    it("waits for the nearest cooldown after every endpoint temporarily fails", async () => {
+        vi.useFakeTimers();
+        vi.spyOn(Math, "random").mockReturnValue(0);
+        const cooldowns: number[] = [];
+        const blockRequests = new Map<string, number>();
+        vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
+            const endpoint = requestUrl(input);
+            const payload = JSON.parse(init?.body as string) as { id: number; method: string };
+            if (payload.method === "eth_chainId") {
+                return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x1" }));
+            }
+            const requestCount = (blockRequests.get(endpoint) ?? 0) + 1;
+            blockRequests.set(endpoint, requestCount);
+            return requestCount === 1
+                ? Promise.reject(new TypeError("connection reset"))
+                : Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x2a" }));
+        }));
+        const manager = new RpcPoolManager({
+            ...config,
+            logger: (event) => {
+                if (event.type === "cooldown") {
+                    cooldowns.push(event.cooldownUntil);
+                }
+            },
+            networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
+            operationTimeoutMs: 10_000,
+        });
+        const callback = vi.fn(async (client: RetryableRpcClient) => await client.getBlockNumber());
+        const operation = manager.executeWithRetry(1, callback);
+        await vi.advanceTimersByTimeAsync(100);
+        expect(cooldowns).toHaveLength(2);
+        const nearestCooldown = Math.min(...cooldowns);
+
+        await vi.advanceTimersByTimeAsync(nearestCooldown - Date.now() - 1);
+        expect(callback).toHaveBeenCalledTimes(2);
+        expect([...blockRequests.values()]).toEqual([1, 1]);
+        await vi.advanceTimersByTimeAsync(11);
+
+        await expect(operation).resolves.toBe(42);
+        expect(callback).toHaveBeenCalledTimes(3);
+        expect([...blockRequests.values()].sort()).toEqual([1, 2]);
+        await manager.close();
+    });
+
+    it("stops selecting an endpoint immediately after its first request timeout", async () => {
+        vi.useFakeTimers();
+        vi.spyOn(Math, "random").mockReturnValue(0);
+        const timedRequestStarted = deferred<undefined>();
+        const methods = new Map<string, string[]>();
+        vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
+            const endpoint = requestUrl(input);
+            const payload = JSON.parse(init?.body as string) as { id: number; method: string };
+            methods.set(endpoint, [...(methods.get(endpoint) ?? []), payload.method]);
+            if (payload.method === "eth_chainId" || endpoint.includes("second")) {
+                return Promise.resolve(rpcResponse(init ?? {}));
+            }
+            return new Promise<Response>((_resolve, reject) => {
+                timedRequestStarted.resolve(undefined);
+                init?.signal?.addEventListener("abort", () => {
+                    reject(init.signal?.reason as Error);
+                }, { once: true });
+            });
+        }));
+        const manager = new RpcPoolManager({
+            ...config,
+            networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
+            operationTimeoutMs: 1_000,
+            requestTimeoutMs: 25,
+        });
+        const operation = manager.executeWithRetry(1, async (client) => await client.getBlockNumber());
+        await vi.advanceTimersByTimeAsync(10);
+        await timedRequestStarted.promise;
+        await vi.advanceTimersByTimeAsync(25);
+
+        await expect(operation).resolves.toBe(42);
+        expect(methods.get("https://first.example/")).toEqual(["eth_chainId", "eth_blockNumber"]);
+        expect(methods.get("https://second.example/")).toEqual(["eth_chainId", "eth_blockNumber"]);
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]).toMatchObject({
+            status: "cooling-down",
+        });
+        await manager.close();
+    });
+
     it.each(["retry", "once"] as const)("deactivates the %s client when its callback times out", async (mode) => {
         vi.useFakeTimers();
         const request = vi.fn((_input: string | URL | Request, init?: RequestInit) =>
