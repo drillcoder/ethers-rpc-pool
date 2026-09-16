@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+    NoUsableRpcEndpointError,
     OperationTimeoutError,
     RpcEndpointDataError,
     RpcPoolClosedError,
@@ -462,6 +463,27 @@ describe("RpcPoolManager operation entry points", () => {
 
         await expect(manager.executeOnce(2, callback)).rejects.toEqual(new UnknownNetworkError(2));
         expect(callback).not.toHaveBeenCalled();
+    });
+
+    it("rejects immediately when chain verification permanently excludes the last endpoint", async () => {
+        const request = vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+            const payload = JSON.parse(init?.body as string) as { id: number };
+            return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x2" }));
+        });
+        vi.stubGlobal("fetch", request);
+        const callback = vi.fn(() => Promise.resolve());
+        const manager = new RpcPoolManager(config);
+
+        await expect(manager.executeOnce(1, callback)).rejects.toEqual(new NoUsableRpcEndpointError(1));
+        await expect(manager.executeWithRetry(1, callback)).rejects.toEqual(new NoUsableRpcEndpointError(1));
+        expect(callback).not.toHaveBeenCalled();
+        expect(request).toHaveBeenCalledOnce();
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]).toMatchObject({
+            cooldownUntil: null,
+            excludedReason: "chain-id-mismatch",
+            status: "excluded",
+        });
+        await manager.close();
     });
 
     it("uses a local timeout as the whole operation budget even when it exceeds the default", async () => {
