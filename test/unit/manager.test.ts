@@ -268,6 +268,47 @@ describe("RpcPoolManager operation entry points", () => {
         expect(events.some(({ type }) => type === "recovery")).toBe(true);
     });
 
+    it("ignores synchronous logger exceptions without changing a successful result or endpoint state", async () => {
+        vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) =>
+            Promise.resolve(rpcResponse(init ?? {}))));
+        const manager = new RpcPoolManager({
+            ...config,
+            logger: (event) => {
+                if (event.type === "response") {
+                    throw new Error("logger failed");
+                }
+            },
+        });
+
+        await expect(manager.executeOnce(1, async (client) => await client.getBlockNumber())).resolves.toBe(42);
+        expect(manager.getSnapshot()).toMatchObject({
+            errorsByCategory: {},
+            networks: [{ endpoints: [{ requestCount: 2, status: "available" }] }],
+            totalRequests: 2,
+        });
+    });
+
+    it("handles rejected logger promises without producing an unhandled rejection", async () => {
+        const unhandledRejection = vi.fn();
+        process.on("unhandledRejection", unhandledRejection);
+        vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) =>
+            Promise.resolve(rpcResponse(init ?? {}))));
+        const manager = new RpcPoolManager({
+            ...config,
+            logger: (event) => event.type === "response"
+                ? Promise.reject(new Error("logger failed"))
+                : Promise.resolve(),
+        });
+
+        try {
+            await expect(manager.executeOnce(1, async (client) => await client.getBlockNumber())).resolves.toBe(42);
+            await Promise.resolve();
+            expect(unhandledRejection).not.toHaveBeenCalled();
+        } finally {
+            process.off("unhandledRejection", unhandledRejection);
+        }
+    });
+
     it("rejects an unknown network before invoking the callback", async () => {
         const callback = vi.fn(() => Promise.resolve());
         const manager = new RpcPoolManager(config);

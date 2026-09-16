@@ -135,7 +135,11 @@ class ManagedEndpoint implements EndpointState {
     }
 
     #emit(event: RpcPoolLoggerEvent): void {
-        void this.#logger?.(Object.freeze(event));
+        try {
+            void Promise.resolve(this.#logger?.(Object.freeze(event))).catch(() => undefined);
+        } catch {
+            // Logging is observational and must not affect pool control flow.
+        }
     }
 
     #transportEvent<Type extends "error" | "response">(
