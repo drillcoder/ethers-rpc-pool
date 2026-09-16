@@ -5,6 +5,7 @@ import {
     recordRpcError,
     recordRpcRequest,
 } from "../observability/counters.js";
+import { sanitizeEndpointUrl } from "../observability/sanitizer.js";
 import type { RpcPoolSnapshot } from "../observability/types.js";
 import { EndpointChainIdVerifier, RpcChainIdMismatchError } from "../transport/chain-id.js";
 import { classifyRpcTransportError } from "../transport/classification.js";
@@ -214,7 +215,7 @@ export class RpcPoolManager {
                 cooldownUntil: endpoint.cooldownUntil === null
                     ? null
                     : epochNow + endpoint.cooldownUntil - monotonicNow,
-                endpointId: new URL(endpoint.rpcUrl).origin,
+                endpointId: sanitizeEndpointUrl(endpoint.rpcUrl),
                 endpointNumber: endpoint.endpointNumber,
                 errorCount: endpoint.counters.errorCount,
                 excludedReason: endpoint.excludedReason,

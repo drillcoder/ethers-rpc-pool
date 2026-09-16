@@ -114,7 +114,7 @@ describe("RpcPoolManager operation entry points", () => {
                     {
                         activeGroups: 0,
                         cooldownUntil: firstEndpoint?.cooldownUntil,
-                        endpointId: "https://first.example",
+                        endpointId: "https://first.example/[redacted]/[redacted]",
                         endpointNumber: 1,
                         errorCount: 1,
                         excludedReason: null,
@@ -125,7 +125,7 @@ describe("RpcPoolManager operation entry points", () => {
                     {
                         activeGroups: 0,
                         cooldownUntil: null,
-                        endpointId: "https://second.example",
+                        endpointId: "https://second.example/rpc",
                         endpointNumber: 2,
                         errorCount: 0,
                         excludedReason: null,
