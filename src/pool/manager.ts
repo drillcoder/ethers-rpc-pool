@@ -1,4 +1,9 @@
-import { OperationTimeoutError, RpcEndpointDataError, UnknownNetworkError } from "../errors/errors.js";
+import {
+    OperationTimeoutError,
+    RpcEndpointDataError,
+    RpcPoolClosedError,
+    UnknownNetworkError,
+} from "../errors/errors.js";
 import {
     createEndpointCounters,
     createRpcCounters,
@@ -209,6 +214,9 @@ async function raceWithAbort<Result>(operation: Promise<Result>, signal: AbortSi
 }
 
 export class RpcPoolManager {
+    readonly #closeController = new AbortController();
+    #closed = false;
+    #closePromise: Promise<void> | null = null;
     readonly #operationTimeoutMs: number;
     readonly #runtime: RuntimeDependencies;
     readonly #state: PoolState<ManagedEndpoint>;
@@ -246,10 +254,12 @@ export class RpcPoolManager {
         callback: (client: RetryableRpcClient) => Promise<Result>,
         options: RpcExecutionOptions = {},
     ): Promise<Result> {
+        this.#assertOpen();
         const network = this.#network(chainId);
         const timeoutMs = options.timeoutMs ?? this.#operationTimeoutMs;
         assertOperationTimeout(timeoutMs);
         options.signal?.throwIfAborted();
+        const operationOptions = this.#operationOptions(options);
         const deadlineMs = this.#runtime.monotonicNow() + timeoutMs;
 
         return await this.#withDeadline(
@@ -257,8 +267,15 @@ export class RpcPoolManager {
             timeoutMs,
             deadlineMs,
             async (termination) =>
-                await this.#executeRetryAttempt(network, callback, options, timeoutMs, deadlineMs, termination),
-            options.signal,
+                await this.#executeRetryAttempt(
+                    network,
+                    callback,
+                    operationOptions,
+                    timeoutMs,
+                    deadlineMs,
+                    termination,
+                ),
+            operationOptions.signal,
         );
     }
 
@@ -267,10 +284,12 @@ export class RpcPoolManager {
         callback: (client: SingleAttemptRpcClient) => Promise<Result>,
         options: RpcExecutionOptions = {},
     ): Promise<Result> {
+        this.#assertOpen();
         const network = this.#network(chainId);
         const timeoutMs = options.timeoutMs ?? this.#operationTimeoutMs;
         assertOperationTimeout(timeoutMs);
         options.signal?.throwIfAborted();
+        const operationOptions = this.#operationOptions(options);
         const deadlineMs = this.#runtime.monotonicNow() + timeoutMs;
 
         return await this.#withDeadline(
@@ -278,9 +297,32 @@ export class RpcPoolManager {
             timeoutMs,
             deadlineMs,
             async (termination) =>
-                await this.#executeOnceAttempt(network, callback, options, timeoutMs, deadlineMs, termination),
-            options.signal,
+                await this.#executeOnceAttempt(
+                    network,
+                    callback,
+                    operationOptions,
+                    timeoutMs,
+                    deadlineMs,
+                    termination,
+                ),
+            operationOptions.signal,
         );
+    }
+
+    public close(): Promise<void> {
+        if (this.#closePromise !== null) {
+            return this.#closePromise;
+        }
+
+        this.#closed = true;
+        this.#closeController.abort(new RpcPoolClosedError());
+        for (const network of this.#state.networks.values()) {
+            for (const endpoint of network.endpoints) {
+                endpoint.provider.destroy();
+            }
+        }
+        this.#closePromise = Promise.resolve();
+        return this.#closePromise;
     }
 
     public getSnapshot(): RpcPoolSnapshot {
@@ -306,7 +348,7 @@ export class RpcPoolManager {
         }));
 
         return Object.freeze({
-            closed: false,
+            closed: this.#closed,
             errorsByCategory,
             networks: Object.freeze(networks),
             requestsByMethod,
@@ -570,6 +612,19 @@ export class RpcPoolManager {
         }
 
         return network;
+    }
+
+    #assertOpen(): void {
+        if (this.#closed) {
+            throw new RpcPoolClosedError();
+        }
+    }
+
+    #operationOptions(options: RpcExecutionOptions): RpcExecutionOptions {
+        const signal = options.signal === undefined
+            ? this.#closeController.signal
+            : AbortSignal.any([options.signal, this.#closeController.signal]);
+        return { ...options, signal };
     }
 
     async #withDeadline<Result>(

@@ -1,7 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { OperationTimeoutError, RpcEndpointDataError, RpcPoolManager, UnknownNetworkError } from "../../src/index.js";
-import { RpcTransportResponseError } from "../../src/transport/provider.js";
+import {
+    OperationTimeoutError,
+    RpcEndpointDataError,
+    RpcPoolClosedError,
+    RpcPoolManager,
+    UnknownNetworkError,
+} from "../../src/index.js";
+import { EndpointJsonRpcProvider, RpcTransportResponseError } from "../../src/transport/provider.js";
 import type {
     RetryableRpcClient,
     RpcExecutionOptions,
@@ -307,6 +313,70 @@ describe("RpcPoolManager operation entry points", () => {
         } finally {
             process.off("unhandledRejection", unhandledRejection);
         }
+    });
+
+    it("closes active requests, destroys providers once, and rejects new operations", async () => {
+        const requestStarted = deferred<undefined>();
+        let requestSignal: AbortSignal | undefined;
+        vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) =>
+            new Promise<Response>((_resolve, reject) => {
+                requestSignal = init?.signal ?? undefined;
+                requestStarted.resolve(undefined);
+                requestSignal?.addEventListener("abort", () => {
+                    // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- Preserve reason.
+                    reject(requestSignal?.reason);
+                }, { once: true });
+            })));
+        const destroy = vi.spyOn(EndpointJsonRpcProvider.prototype, "destroy");
+        const callback = vi.fn(() => Promise.resolve());
+        const manager = new RpcPoolManager(config);
+        const operation = manager.executeOnce(1, callback);
+        await requestStarted.promise;
+
+        const firstClose = manager.close();
+        const secondClose = manager.close();
+
+        expect(secondClose).toBe(firstClose);
+        await expect(firstClose).resolves.toBeUndefined();
+        await expect(operation).rejects.toBeInstanceOf(RpcPoolClosedError);
+        expect(requestSignal?.aborted).toBe(true);
+        expect(requestSignal?.reason).toBeInstanceOf(RpcPoolClosedError);
+        expect(callback).not.toHaveBeenCalled();
+        expect(destroy).toHaveBeenCalledOnce();
+        expect(manager.getSnapshot()).toMatchObject({ closed: true, totalActiveGroups: 0 });
+        await expect(manager.executeOnce(1, callback)).rejects.toBeInstanceOf(RpcPoolClosedError);
+        expect(globalThis.fetch).toHaveBeenCalledOnce();
+    });
+
+    it("clears operation and cooldown wait timers when closed", async () => {
+        vi.useFakeTimers();
+        const cooldownStarted = deferred<undefined>();
+        vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+            const payload = JSON.parse(init?.body as string) as { id: number; method: string };
+            return payload.method === "eth_chainId"
+                ? Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x1" }))
+                : Promise.reject(new TypeError("connection reset"));
+        }));
+        const manager = new RpcPoolManager({
+            ...config,
+            logger: (event) => {
+                if (event.type === "cooldown") {
+                    cooldownStarted.resolve(undefined);
+                }
+            },
+            operationTimeoutMs: 10_000,
+        });
+        const operation = manager.executeWithRetry(1, async (client) => await client.getBlockNumber());
+        await vi.advanceTimersByTimeAsync(10);
+        await cooldownStarted.promise;
+        await Promise.resolve();
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]?.status).toBe("cooling-down");
+        const timerCountBeforeClose = vi.getTimerCount();
+
+        await manager.close();
+
+        await expect(operation).rejects.toBeInstanceOf(RpcPoolClosedError);
+        expect(timerCountBeforeClose - vi.getTimerCount()).toBeGreaterThanOrEqual(2);
     });
 
     it("rejects an unknown network before invoking the callback", async () => {
