@@ -159,7 +159,7 @@ describe("reserveEndpoint", () => {
         expect(reserveEndpoint(network, 0)?.endpoint).toBe(second);
     });
 
-    it("uses round-robin for cold start and equal measured latency", () => {
+    it("uses round-robin to sample every endpoint during cold start", () => {
         const network = createNetwork();
         const first = network.endpoints[0];
         const second = network.endpoints[1];
@@ -170,11 +170,20 @@ describe("reserveEndpoint", () => {
 
         expect(reserveEndpoint(network, 0)?.endpoint).toBe(first);
         first.activeGroups = 0;
+        first.latencyEwmaMs = 1;
         network.activeGroups = 0;
         expect(reserveEndpoint(network, 0)?.endpoint).toBe(second);
+    });
 
-        second.activeGroups = 0;
-        network.activeGroups = 0;
+    it("uses round-robin when measured latency is equal", () => {
+        const network = createNetwork();
+        const first = network.endpoints[0];
+        const second = network.endpoints[1];
+
+        if (first === undefined || second === undefined) {
+            throw new Error("Expected test endpoints");
+        }
+
         first.latencyEwmaMs = 50;
         second.latencyEwmaMs = 50;
         expect(reserveEndpoint(network, 0)?.endpoint).toBe(first);

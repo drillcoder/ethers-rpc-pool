@@ -824,7 +824,9 @@ describe("RpcPoolManager operation entry points", () => {
             if (endpoint.includes("first") && methods.length === 3) {
                 return Promise.reject(new TypeError("connection reset"));
             }
-            const result = payload.method === "eth_chainId" ? "0x1" : "0x1";
+            const result = payload.method === "eth_chainId"
+                ? "0x1"
+                : endpoint.includes("first") ? "0xa" : methods.length === 2 ? "0x14" : "0x15";
             return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result }));
         }));
         const manager = new RpcPoolManager({
@@ -832,15 +834,18 @@ describe("RpcPoolManager operation entry points", () => {
             networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
         });
         const clients: RetryableRpcClient[] = [];
+        const firstResults: bigint[] = [];
         const callback = vi.fn(async (client: RetryableRpcClient): Promise<bigint[]> => {
             clients.push(client);
             const first = await client.getBalance("0x0000000000000000000000000000000000000001");
+            firstResults.push(first);
             const second = await client.getBalance("0x0000000000000000000000000000000000000002");
             return [first, second];
         });
 
-        await expect(manager.executeWithRetry(1, callback)).resolves.toEqual([1n, 1n]);
+        await expect(manager.executeWithRetry(1, callback)).resolves.toEqual([20n, 21n]);
         expect(callback).toHaveBeenCalledTimes(2);
+        expect(firstResults).toEqual([10n, 20n]);
         for (const client of clients) {
             await expect(client.getBlockNumber()).rejects.toThrow("RPC client attempt is no longer active");
         }
