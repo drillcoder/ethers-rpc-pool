@@ -5,6 +5,7 @@ import { RpcTransportResponseError } from "../../src/transport/provider.js";
 import type {
     RetryableRpcClient,
     RpcExecutionOptions,
+    RpcPoolLoggerEvent,
     RpcPoolManagerConfig,
     SingleAttemptRpcClient,
 } from "../../src/index.js";
@@ -165,6 +166,106 @@ describe("RpcPoolManager operation entry points", () => {
 
         callbackFinished.resolve(undefined);
         await operation;
+    });
+
+    it("logs transport, cooldown, and switch events with safe endpoint identifiers", async () => {
+        const events: RpcPoolLoggerEvent[] = [];
+        vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
+            const payload = JSON.parse(init?.body as string) as { id: number; method: string };
+            if (payload.method === "eth_chainId") {
+                return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x1" }));
+            }
+            if (new URL(requestUrl(input)).hostname === "first.example") {
+                return Promise.resolve(Response.json(
+                    { id: payload.id, jsonrpc: "2.0", result: "limited" },
+                    { headers: { "retry-after": "2" }, status: 429 },
+                ));
+            }
+            return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x2a" }));
+        }));
+        const manager = new RpcPoolManager({
+            ...config,
+            logger: (event) => {
+                events.push(event);
+            },
+            networks: [{
+                chainId: 1,
+                rpcUrls: [
+                    "https://user:password@first.example/v3/0123456789abcdef0123456789abcdef?token=secret",
+                    "https://second.example/rpc",
+                ],
+            }],
+        });
+
+        await manager.executeWithRetry(1, async (client) => await client.getBlockNumber());
+
+        expect(events.map(({ type }) => type)).toEqual([
+            "request",
+            "response",
+            "request",
+            "error",
+            "cooldown",
+            "switch",
+            "request",
+            "response",
+            "request",
+            "response",
+        ]);
+        expect(events.find(({ type }) => type === "error")).toMatchObject({
+            category: "rate-limit",
+            endpointId: "https://first.example/v3/[redacted]",
+            httpStatus: 429,
+            method: "eth_blockNumber",
+            retryAfterMs: 2_000,
+        });
+        expect(events.find(({ type }) => type === "switch")).toMatchObject({
+            category: "rate-limit",
+            endpointNumber: 1,
+            nextEndpointId: "https://second.example/rpc",
+            nextEndpointNumber: 2,
+        });
+        expect(events.find(({ type }) => type === "cooldown")).toMatchObject({
+            category: "rate-limit",
+            endpointNumber: 1,
+        });
+        expect(JSON.stringify(events)).not.toContain("password");
+        expect(JSON.stringify(events)).not.toContain("token=secret");
+    });
+
+    it("logs recovery after a successful probe", async () => {
+        vi.useFakeTimers();
+        const events: RpcPoolLoggerEvent[] = [];
+        let blockRequests = 0;
+        vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+            const payload = JSON.parse(init?.body as string) as { id: number; method: string };
+            if (payload.method === "eth_chainId") {
+                return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x1" }));
+            }
+            blockRequests += 1;
+            return blockRequests === 1
+                ? Promise.reject(new TypeError("connection reset"))
+                : Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x2a" }));
+        }));
+        const manager = new RpcPoolManager({
+            ...config,
+            logger: (event) => {
+                events.push(event);
+            },
+            operationTimeoutMs: 10_000,
+        });
+        const operation = manager.executeWithRetry(1, async (client) => await client.getBlockNumber());
+
+        await vi.waitFor(() => {
+            expect(events.some(({ type }) => type === "cooldown")).toBe(true);
+        });
+        const cooldown = events.find((event) => event.type === "cooldown");
+        if (cooldown?.type !== "cooldown") {
+            throw new Error("Expected cooldown event");
+        }
+        await vi.advanceTimersByTimeAsync(Math.ceil(cooldown.cooldownUntil - Date.now()) + 1);
+
+        await expect(operation).resolves.toBe(42);
+        expect(events.some(({ type }) => type === "recovery")).toBe(true);
     });
 
     it("rejects an unknown network before invoking the callback", async () => {

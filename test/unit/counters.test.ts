@@ -42,9 +42,9 @@ describe("RPC counters", () => {
         const onError = vi.fn();
         const onRequest = vi.fn();
         const observer: RpcTransportObserver = {
-            onComplete: vi.fn(),
             onError,
             onRequest,
+            onResponse: vi.fn(),
         };
         const provider = new EndpointJsonRpcProvider("https://rpc.example", 1, {
             observer,
@@ -55,9 +55,15 @@ describe("RPC counters", () => {
         await expect(provider.send("eth_chainId", [])).rejects.toBe(failure);
 
         expect(onRequest).toHaveBeenCalledOnce();
-        expect(onRequest).toHaveBeenCalledWith("eth_chainId");
+        expect(onRequest).toHaveBeenCalledWith("eth_chainId", expect.any(Number));
         expect(onError).toHaveBeenCalledOnce();
-        expect(onError).toHaveBeenCalledWith(failure);
+        expect(onError).toHaveBeenCalledWith(
+            "eth_chainId",
+            failure,
+            expect.any(Number),
+            expect.any(Number),
+            expect.any(Number),
+        );
         provider.destroy();
     });
 });

@@ -24,9 +24,9 @@ export interface EndpointJsonRpcProviderOptions {
 }
 
 export interface RpcTransportObserver {
-    onComplete(durationMs: number): void;
-    onError(error: unknown): void;
-    onRequest(method: string): void;
+    onError(method: string, error: unknown, startedAt: number, finishedAt: number, durationMs: number): void;
+    onRequest(method: string, startedAt: number): void;
+    onResponse(method: string, startedAt: number, finishedAt: number, durationMs: number): void;
 }
 
 interface RequestContext {
@@ -116,15 +116,29 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
             throw new RpcRequestTimeoutError(0);
         }
 
-        this.#observer?.onRequest(payload.method);
-        const startedAt = this.#runtime.monotonicNow();
+        const startedAt = this.#runtime.epochNow();
+        const startedMonotonic = this.#runtime.monotonicNow();
+        this.#observer?.onRequest(payload.method, startedAt);
         try {
-            return await this.#requestPayload(payload, context, remainingMs);
+            const result = await this.#requestPayload(payload, context, remainingMs);
+            const finishedAt = this.#runtime.epochNow();
+            this.#observer?.onResponse(
+                payload.method,
+                startedAt,
+                finishedAt,
+                this.#runtime.monotonicNow() - startedMonotonic,
+            );
+            return result;
         } catch (error: unknown) {
-            this.#observer?.onError(error);
+            const finishedAt = this.#runtime.epochNow();
+            this.#observer?.onError(
+                payload.method,
+                error,
+                startedAt,
+                finishedAt,
+                this.#runtime.monotonicNow() - startedMonotonic,
+            );
             throw error;
-        } finally {
-            this.#observer?.onComplete(this.#runtime.monotonicNow() - startedAt);
         }
     }
 
