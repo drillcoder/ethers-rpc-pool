@@ -174,6 +174,83 @@ describe("RpcPoolManager operation entry points", () => {
         await operation;
     });
 
+    it("shares active-group selection and counters between concurrent consumers", async () => {
+        const firstStarted = deferred<undefined>();
+        const secondStarted = deferred<undefined>();
+        const releaseCallbacks = deferred<undefined>();
+        const requests: string[] = [];
+        vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
+            const payload = JSON.parse(init?.body as string) as { id: number; method: string };
+            requests.push(`${new URL(requestUrl(input)).hostname}:${payload.method}`);
+            return Promise.resolve(rpcResponse(init ?? {}));
+        }));
+        const manager = new RpcPoolManager({
+            ...config,
+            networks: [{
+                chainId: 1,
+                rpcUrls: ["https://first.example", "https://second.example"],
+            }],
+        });
+        const first = manager.executeOnce(1, async (client) => {
+            await client.send("debug_first", []);
+            firstStarted.resolve(undefined);
+            await releaseCallbacks.promise;
+        });
+        await firstStarted.promise;
+        const second = manager.executeOnce(1, async (client) => {
+            await client.send("debug_second", []);
+            secondStarted.resolve(undefined);
+            await releaseCallbacks.promise;
+        });
+        await secondStarted.promise;
+
+        expect(manager.getSnapshot()).toMatchObject({
+            networks: [{ endpoints: [{ activeGroups: 1 }, { activeGroups: 1 }] }],
+            requestsByMethod: { debug_first: 1, debug_second: 1, eth_chainId: 2 },
+            totalActiveGroups: 2,
+            totalRequests: 4,
+        });
+        expect(requests).toEqual([
+            "first.example:eth_chainId",
+            "first.example:debug_first",
+            "second.example:eth_chainId",
+            "second.example:debug_second",
+        ]);
+
+        releaseCallbacks.resolve(undefined);
+        await Promise.all([first, second]);
+        expect(manager.getSnapshot().totalActiveGroups).toBe(0);
+        await manager.close();
+    });
+
+    it("keeps health, counters, and selection independent between identically configured managers", async () => {
+        vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) =>
+            Promise.resolve(rpcResponse(init ?? {}))));
+        const firstManager = new RpcPoolManager(config);
+        const secondManager = new RpcPoolManager(config);
+
+        await expect(firstManager.executeOnce(1, () => Promise.reject(new RpcEndpointDataError())))
+            .rejects.toBeInstanceOf(RpcEndpointDataError);
+        expect(firstManager.getSnapshot()).toMatchObject({
+            errorsByCategory: { "endpoint-data": 1 },
+            networks: [{ endpoints: [{ errorCount: 1, requestCount: 1, status: "cooling-down" }] }],
+            totalRequests: 1,
+        });
+        expect(secondManager.getSnapshot()).toMatchObject({
+            errorsByCategory: {},
+            networks: [{ endpoints: [{ errorCount: 0, requestCount: 0, status: "available" }] }],
+            totalRequests: 0,
+        });
+
+        await expect(secondManager.executeOnce(1, () => Promise.resolve("available"))).resolves.toBe("available");
+        expect(secondManager.getSnapshot()).toMatchObject({
+            networks: [{ endpoints: [{ requestCount: 1, status: "available" }] }],
+            totalRequests: 1,
+        });
+        expect(firstManager.getSnapshot().networks[0]?.endpoints[0]?.status).toBe("cooling-down");
+        await Promise.all([firstManager.close(), secondManager.close()]);
+    });
+
     it("logs transport, cooldown, and switch events with safe endpoint identifiers", async () => {
         const events: RpcPoolLoggerEvent[] = [];
         vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
