@@ -791,6 +791,72 @@ describe("RpcPoolManager operation entry points", () => {
         }
     });
 
+    it.each([
+        ["HTTP 401", 401, undefined],
+        ["HTTP 403", 403, undefined],
+        ["JSON-RPC authorization", 200, { code: -32_000, message: "invalid API key" }],
+    ] as const)("permanently excludes an endpoint after %s", async (_case, status, jsonRpcError) => {
+        vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
+            const payload = JSON.parse(init?.body as string) as { id: number; method: string };
+            if (payload.method === "eth_chainId") {
+                return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x1" }));
+            }
+            if (new URL(requestUrl(input)).hostname === "first.example") {
+                const body = jsonRpcError === undefined
+                    ? { id: payload.id, jsonrpc: "2.0", result: "denied" }
+                    : { error: jsonRpcError, id: payload.id, jsonrpc: "2.0" };
+                return Promise.resolve(Response.json(body, { status }));
+            }
+            return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x2a" }));
+        }));
+        const manager = new RpcPoolManager({
+            ...config,
+            networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
+        });
+        const callback = vi.fn(async (client: RetryableRpcClient) => await client.getBlockNumber());
+
+        await expect(manager.executeWithRetry(1, callback)).resolves.toBe(42);
+        expect(callback).toHaveBeenCalledTimes(2);
+        expect(manager.getSnapshot()).toMatchObject({
+            errorsByCategory: { authorization: 1 },
+            networks: [{ endpoints: [{
+                cooldownUntil: null,
+                excludedReason: "authorization",
+                status: "excluded",
+            }, { status: "available" }] }],
+        });
+        await manager.close();
+    });
+
+    it("applies Retry-After to HTTP 402 quota exhaustion before switching endpoint", async () => {
+        const startedAt = Date.now();
+        vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
+            const payload = JSON.parse(init?.body as string) as { id: number; method: string };
+            if (payload.method === "eth_chainId") {
+                return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x1" }));
+            }
+            if (new URL(requestUrl(input)).hostname === "first.example") {
+                return Promise.resolve(Response.json(
+                    { id: payload.id, jsonrpc: "2.0", result: "quota exhausted" },
+                    { headers: { "retry-after": "600" }, status: 402 },
+                ));
+            }
+            return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x2a" }));
+        }));
+        const manager = new RpcPoolManager({
+            ...config,
+            networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
+        });
+
+        await expect(manager.executeWithRetry(1, async (client) => await client.getBlockNumber())).resolves.toBe(42);
+        const firstEndpoint = manager.getSnapshot().networks[0]?.endpoints[0];
+        expect(firstEndpoint).toMatchObject({ excludedReason: null, status: "cooling-down" });
+        expect(firstEndpoint?.cooldownUntil).toBeGreaterThanOrEqual(startedAt + 600_000);
+        expect(firstEndpoint?.cooldownUntil).toBeLessThanOrEqual(Date.now() + 720_000);
+        expect(manager.getSnapshot().errorsByCategory).toEqual({ "quota-limit": 1 });
+        await manager.close();
+    });
+
     it("deactivates a retryable client when its callback finishes", async () => {
         const request = vi.fn((_input: string | URL | Request, init?: RequestInit) =>
             Promise.resolve(rpcResponse(init ?? {})));
