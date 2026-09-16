@@ -58,6 +58,24 @@ function executeInMode<Result>(
         : manager.executeOnce(1, callback, options);
 }
 
+async function coolDownOnlyEndpoint(manager: RpcPoolManager): Promise<void> {
+    const operation = manager.executeOnce(1, () => Promise.reject(new RpcEndpointDataError("invalid data")));
+    const rejection = expect(operation).rejects.toBeInstanceOf(RpcEndpointDataError);
+    await vi.advanceTimersByTimeAsync(10);
+    await rejection;
+    await vi.advanceTimersByTimeAsync(5_000);
+}
+
+async function createCooledEndpointManager(): Promise<RpcPoolManager> {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) =>
+        Promise.resolve(rpcResponse(init ?? {}))));
+    const manager = new RpcPoolManager({ ...config, operationTimeoutMs: 10_000 });
+    await coolDownOnlyEndpoint(manager);
+    return manager;
+}
+
 describe("RpcPoolManager operation entry points", () => {
     afterEach(() => {
         vi.restoreAllMocks();
@@ -650,6 +668,75 @@ describe("RpcPoolManager operation entry points", () => {
         expect(manager.getSnapshot().networks[0]?.endpoints[0]).toMatchObject({
             status: "cooling-down",
         });
+        await manager.close();
+    });
+
+    it("permits exactly one concurrent probe group after cooldown", async () => {
+        const manager = await createCooledEndpointManager();
+
+        const probeStarted = deferred<undefined>();
+        const releaseProbe = deferred<undefined>();
+        const callback = vi.fn(async () => {
+            if (callback.mock.calls.length === 1) {
+                probeStarted.resolve(undefined);
+                await releaseProbe.promise;
+            }
+            return "complete";
+        });
+        const first = manager.executeOnce(1, callback);
+        await probeStarted.promise;
+        const second = manager.executeOnce(1, callback);
+        await Promise.resolve();
+
+        expect(callback).toHaveBeenCalledOnce();
+        expect(manager.getSnapshot()).toMatchObject({
+            networks: [{ endpoints: [{ activeGroups: 1, status: "probe" }] }],
+            totalActiveGroups: 1,
+        });
+
+        releaseProbe.resolve(undefined);
+        await expect(first).resolves.toBe("complete");
+        await expect(second).resolves.toBe("complete");
+        expect(callback).toHaveBeenCalledTimes(2);
+        expect(manager.getSnapshot()).toMatchObject({
+            networks: [{ endpoints: [{ activeGroups: 0, status: "available" }] }],
+            totalActiveGroups: 0,
+        });
+        await manager.close();
+    });
+
+    it.each(["abort", "timeout", "close"] as const)("releases a probe slot after operation %s", async (outcome) => {
+        const manager = await createCooledEndpointManager();
+
+        const callbackStarted = deferred<undefined>();
+        const callbackFinished = deferred<undefined>();
+        const controller = new AbortController();
+        const reason = new Error("cancelled");
+        const operation = manager.executeOnce(1, async () => {
+            callbackStarted.resolve(undefined);
+            await callbackFinished.promise;
+            return "finished";
+        }, { signal: controller.signal, timeoutMs: 25 });
+        await callbackStarted.promise;
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]?.status).toBe("probe");
+
+        if (outcome === "abort") {
+            controller.abort(reason);
+            await expect(operation).rejects.toBe(reason);
+        } else if (outcome === "timeout") {
+            const timeoutRejection = expect(operation).rejects.toBeInstanceOf(OperationTimeoutError);
+            await vi.advanceTimersByTimeAsync(25);
+            await timeoutRejection;
+        } else {
+            await manager.close();
+            await expect(operation).rejects.toBeInstanceOf(RpcPoolClosedError);
+        }
+
+        expect(manager.getSnapshot()).toMatchObject({
+            networks: [{ endpoints: [{ activeGroups: 0, status: "cooling-down" }] }],
+            totalActiveGroups: 0,
+        });
+        callbackFinished.resolve(undefined);
         await manager.close();
     });
 
