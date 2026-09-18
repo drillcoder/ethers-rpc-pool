@@ -882,6 +882,8 @@ describe("RpcPoolManager operation entry points", () => {
     });
 
     it.each(["retry", "once"] as const)("absorbs a late transport rejection in %s mode", async (mode) => {
+        const unhandledRejection = vi.fn();
+        process.on("unhandledRejection", unhandledRejection);
         const late = deferred<Response>();
         vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) => {
             const payload = JSON.parse(init?.body as string) as { id: number; method: string };
@@ -894,17 +896,22 @@ describe("RpcPoolManager operation entry points", () => {
         const reason = new Error("cancelled");
         const callback = vi.fn(async (client: RetryableRpcClient | SingleAttemptRpcClient) =>
             await client.getBlockNumber());
-        const operation = executeInMode(manager, mode, callback, { signal: controller.signal });
+        try {
+            const operation = executeInMode(manager, mode, callback, { signal: controller.signal });
 
-        await vi.waitFor(() => {
-            expect(callback).toHaveBeenCalledOnce();
-        });
-        controller.abort(reason);
-        await expect(operation).rejects.toBe(reason);
-        late.reject(new TypeError("late connection failure"));
-        await Promise.resolve();
+            await vi.waitFor(() => {
+                expect(callback).toHaveBeenCalledOnce();
+            });
+            controller.abort(reason);
+            await expect(operation).rejects.toBe(reason);
+            late.reject(new TypeError("late connection failure"));
+            await Promise.resolve();
 
-        await expect(manager.executeOnce(1, () => Promise.resolve("available"))).resolves.toBe("available");
+            expect(unhandledRejection).not.toHaveBeenCalled();
+            await expect(manager.executeOnce(1, () => Promise.resolve("available"))).resolves.toBe("available");
+        } finally {
+            process.off("unhandledRejection", unhandledRejection);
+        }
     });
 
     it("rejects an invalid local timeout before invoking the callback", async () => {
@@ -1184,6 +1191,43 @@ describe("RpcPoolManager operation entry points", () => {
             "https://second.example/",
             "https://second.example/",
         ]);
+    });
+
+    it("restarts a retryable callback after its endpoint cools between client calls", async () => {
+        vi.useFakeTimers();
+        vi.spyOn(Math, "random").mockReturnValue(0);
+        const methods: string[] = [];
+        vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+            const payload = JSON.parse(init?.body as string) as { method: string };
+            methods.push(payload.method);
+            return Promise.resolve(rpcResponse(init ?? {}));
+        }));
+        const manager = new RpcPoolManager({ ...config, operationTimeoutMs: 10_000 });
+        const firstCallFinished = deferred<undefined>();
+        const resumeFirstCallback = deferred<undefined>();
+        const callback = vi.fn(async (client: RetryableRpcClient) => {
+            await client.getBlockNumber();
+            if (callback.mock.calls.length === 1) {
+                firstCallFinished.resolve(undefined);
+                await resumeFirstCallback.promise;
+            }
+            return await client.getBalance("0x0000000000000000000000000000000000000001");
+        });
+        const operation = manager.executeWithRetry(1, callback);
+        await vi.advanceTimersByTimeAsync(10);
+        await firstCallFinished.promise;
+
+        const cooling = manager.executeOnce(1, () => Promise.reject(new RpcEndpointDataError("invalid data")));
+        const coolingRejection = expect(cooling).rejects.toBeInstanceOf(RpcEndpointDataError);
+        await vi.advanceTimersByTimeAsync(10);
+        await coolingRejection;
+        resumeFirstCallback.resolve(undefined);
+        await vi.advanceTimersByTimeAsync(5_000);
+
+        await expect(operation).resolves.toBe(42n);
+        expect(callback).toHaveBeenCalledTimes(2);
+        expect(methods).toEqual(["eth_chainId", "eth_blockNumber", "eth_blockNumber", "eth_getBalance"]);
+        await manager.close();
     });
 
     it("rejects an obsolete single-attempt call without transport or callback restart", async () => {
