@@ -202,7 +202,9 @@ describe("createRetryableRpcAttempt", () => {
         }
 
         attempt.deactivate();
-        await expect(block.provider.getBlockNumber()).rejects.toThrow("RPC client attempt is no longer active");
+        for (const result of nonNullResults) {
+            await expect(result.provider.getBlockNumber()).rejects.toThrow("RPC client attempt is no longer active");
+        }
         provider.destroy();
     });
 });

@@ -179,6 +179,36 @@ describe("RpcPoolManager operation entry points", () => {
         expect(manager.getSnapshot().totalRequests).toBe(4);
     });
 
+    it("reports exact request counters and latency EWMA in its snapshot", async () => {
+        vi.useFakeTimers();
+        let requestNumber = 0;
+        vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+            requestNumber += 1;
+            const delayMs = requestNumber === 1 ? 10 : 30;
+            return new Promise<Response>((resolve) => {
+                setTimeout(() => {
+                    resolve(rpcResponse(init ?? {}));
+                }, delayMs);
+            });
+        }));
+        const manager = new RpcPoolManager(config);
+        const operation = manager.executeOnce(1, async (client) => await client.getBlockNumber());
+
+        await vi.advanceTimersByTimeAsync(10);
+        await vi.advanceTimersByTimeAsync(10);
+        expect(requestNumber).toBe(2);
+        await vi.advanceTimersByTimeAsync(30);
+
+        await expect(operation).resolves.toBe(42);
+        expect(manager.getSnapshot()).toMatchObject({
+            errorsByCategory: {},
+            networks: [{ endpoints: [{ errorCount: 0, latencyEwmaMs: 14, requestCount: 2 }] }],
+            requestsByMethod: { eth_blockNumber: 1, eth_chainId: 1 },
+            totalRequests: 2,
+        });
+        await manager.close();
+    });
+
     it("reports active groups while an operation is running", async () => {
         vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) =>
             Promise.resolve(rpcResponse(init ?? {}))));
@@ -430,7 +460,10 @@ describe("RpcPoolManager operation entry points", () => {
             })));
         const destroy = vi.spyOn(EndpointJsonRpcProvider.prototype, "destroy");
         const callback = vi.fn(() => Promise.resolve());
-        const manager = new RpcPoolManager(config);
+        const manager = new RpcPoolManager({
+            ...config,
+            networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
+        });
         const operation = manager.executeOnce(1, callback);
         await requestStarted.promise;
 
@@ -443,7 +476,8 @@ describe("RpcPoolManager operation entry points", () => {
         expect(requestSignal?.aborted).toBe(true);
         expect(requestSignal?.reason).toBeInstanceOf(RpcPoolClosedError);
         expect(callback).not.toHaveBeenCalled();
-        expect(destroy).toHaveBeenCalledOnce();
+        expect(destroy).toHaveBeenCalledTimes(2);
+        expect(new Set(destroy.mock.instances)).toHaveLength(2);
         expect(manager.getSnapshot()).toMatchObject({ closed: true, totalActiveGroups: 0 });
         await expect(manager.executeOnce(1, callback)).rejects.toBeInstanceOf(RpcPoolClosedError);
         expect(globalThis.fetch).toHaveBeenCalledOnce();
