@@ -63,16 +63,21 @@ async function coolDownOnlyEndpoint(manager: RpcPoolManager): Promise<void> {
     const rejection = expect(operation).rejects.toBeInstanceOf(RpcEndpointDataError);
     await vi.advanceTimersByTimeAsync(10);
     await rejection;
-    await vi.advanceTimersByTimeAsync(5_000);
 }
 
-async function createCooledEndpointManager(): Promise<RpcPoolManager> {
+async function createManagerDuringCooldown(): Promise<RpcPoolManager> {
     vi.useFakeTimers();
     vi.spyOn(Math, "random").mockReturnValue(0);
     vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) =>
         Promise.resolve(rpcResponse(init ?? {}))));
     const manager = new RpcPoolManager({ ...config, operationTimeoutMs: 10_000 });
     await coolDownOnlyEndpoint(manager);
+    return manager;
+}
+
+async function createCooledEndpointManager(): Promise<RpcPoolManager> {
+    const manager = await createManagerDuringCooldown();
+    await vi.advanceTimersByTimeAsync(5_000);
     return manager;
 }
 
@@ -797,6 +802,53 @@ describe("RpcPoolManager operation entry points", () => {
         await expect(operation).rejects.toBe(reason);
         expect(callback).not.toHaveBeenCalled();
         expect(request).not.toHaveBeenCalled();
+    });
+
+    it.each(["retry", "once"] as const)("aborts chain verification in %s mode", async (mode) => {
+        const requestStarted = deferred<undefined>();
+        let requestSignal: AbortSignal | undefined;
+        vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+            requestSignal = init?.signal ?? undefined;
+            requestStarted.resolve(undefined);
+            return await new Promise<Response>((_resolve, reject) => {
+                requestSignal?.addEventListener("abort", () => {
+                    // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- Mirror fetch.
+                    reject(requestSignal?.reason);
+                }, { once: true });
+            });
+        }));
+        const manager = new RpcPoolManager(config);
+        const controller = new AbortController();
+        const reason = new Error("chain verification cancelled");
+        const callback = vi.fn(() => Promise.resolve());
+        const operation = executeInMode(manager, mode, callback, { signal: controller.signal });
+
+        await requestStarted.promise;
+        controller.abort(reason);
+
+        await expect(operation).rejects.toBe(reason);
+        expect(requestSignal?.aborted).toBe(true);
+        expect(callback).not.toHaveBeenCalled();
+        await vi.waitFor(() => {
+            expect(manager.getSnapshot().totalActiveGroups).toBe(0);
+        });
+    });
+
+    it.each(["retry", "once"] as const)("aborts cooldown waiting in %s mode", async (mode) => {
+        const manager = await createManagerDuringCooldown();
+
+        const controller = new AbortController();
+        const reason = new Error("cooldown wait cancelled");
+        const callback = vi.fn(() => Promise.resolve());
+        const operation = executeInMode(manager, mode, callback, { signal: controller.signal });
+        await Promise.resolve();
+        expect(vi.getTimerCount()).toBeGreaterThan(0);
+        controller.abort(reason);
+
+        await expect(operation).rejects.toBe(reason);
+        expect(callback).not.toHaveBeenCalled();
+        expect(manager.getSnapshot().totalActiveGroups).toBe(0);
+        await manager.close();
     });
 
     it.each(["retry", "once"] as const)("aborts an active request in %s mode", async (mode) => {
