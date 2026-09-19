@@ -26,6 +26,22 @@ function providerOptions(request: HttpRequest) {
 }
 
 describe("EndpointJsonRpcProvider", () => {
+    it("forwards an already aborted operation signal to the request", async () => {
+        const controller = new AbortController();
+        const reason = new Error("already aborted");
+        controller.abort(reason);
+        const request = vi.fn<HttpRequest>(() => Promise.reject(reason));
+        const provider = new EndpointJsonRpcProvider(rpcUrl, 1, providerOptions(request));
+
+        await expect(provider.runWithDeadline(
+            performance.now() + 1_000,
+            async () => await provider.getBlockNumber(),
+            controller.signal,
+        )).rejects.toBe(reason);
+        expect(request).toHaveBeenCalledOnce();
+        provider.destroy();
+    });
+
     it("uses the environment fetch implementation by default", async () => {
         const request = vi
             .spyOn(globalThis, "fetch")

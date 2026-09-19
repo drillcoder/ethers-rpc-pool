@@ -168,6 +168,8 @@ interface PreviousFailure {
     readonly endpoint: ManagedEndpoint;
 }
 
+type OperationOptions = Omit<RpcExecutionOptions, "signal"> & { readonly signal: AbortSignal };
+
 class OperationDeadline {
     public readonly promise: Promise<never>;
     readonly #runtime: RuntimeDependencies;
@@ -193,10 +195,7 @@ function assertOperationTimeout(timeoutMs: number): void {
     }
 }
 
-async function raceWithAbort<Result>(operation: Promise<Result>, signal: AbortSignal | undefined): Promise<Result> {
-    if (signal === undefined) {
-        return await operation;
-    }
+async function raceWithAbort<Result>(operation: Promise<Result>, signal: AbortSignal): Promise<Result> {
     signal.throwIfAborted();
 
     let abort!: () => void;
@@ -363,7 +362,7 @@ export class RpcPoolManager {
     async #executeOnceAttempt<Result>(
         network: NetworkState<ManagedEndpoint>,
         callback: (client: SingleAttemptRpcClient) => Promise<Result>,
-        options: RpcExecutionOptions,
+        options: OperationOptions,
         timeoutMs: number,
         deadlineMs: number,
         termination: Promise<never>,
@@ -392,7 +391,7 @@ export class RpcPoolManager {
                 reservation,
                 async () => await endpoint.provider.runWithDeadline(deadlineMs, async () => {
                     await endpoint.verifier.verify();
-                    options.signal?.throwIfAborted();
+                    options.signal.throwIfAborted();
                     callbackStarted = true;
                     const attempt = createSingleRpcAttempt(
                         endpoint.provider,
@@ -412,7 +411,7 @@ export class RpcPoolManager {
             this.#emitRecovery(reservation.requiresProbe, endpoint);
             return result;
         } catch (error: unknown) {
-            options.signal?.throwIfAborted();
+            options.signal.throwIfAborted();
             const decision = this.#handleSingleFailure(endpoint, error, callbackStarted);
             notifyNetworkStateChanged(network);
             if (!decision.retry) {
@@ -433,7 +432,7 @@ export class RpcPoolManager {
     async #executeRetryAttempt<Result>(
         network: NetworkState<ManagedEndpoint>,
         callback: (client: RetryableRpcClient) => Promise<Result>,
-        options: RpcExecutionOptions,
+        options: OperationOptions,
         timeoutMs: number,
         deadlineMs: number,
         termination: Promise<never>,
@@ -462,7 +461,7 @@ export class RpcPoolManager {
                 reservation,
                 async () => await endpoint.provider.runWithDeadline(deadlineMs, async () => {
                     await endpoint.verifier.verify();
-                    options.signal?.throwIfAborted();
+                    options.signal.throwIfAborted();
                     callbackStarted = true;
                     const attempt = createRetryableRpcAttempt(
                         endpoint.provider,
@@ -482,7 +481,7 @@ export class RpcPoolManager {
             this.#emitRecovery(reservation.requiresProbe, endpoint);
             return result;
         } catch (error: unknown) {
-            options.signal?.throwIfAborted();
+            options.signal.throwIfAborted();
             const decision = this.#handleRetryFailure(endpoint, error, callbackStarted);
             notifyNetworkStateChanged(network);
             if (!decision.retry) {
@@ -595,14 +594,16 @@ export class RpcPoolManager {
 
     async #waitForEndpoint(
         network: NetworkState<ManagedEndpoint>,
-        options: RpcExecutionOptions,
+        options: OperationOptions,
         timeoutMs: number,
         deadlineMs: number,
     ): Promise<void> {
-        const waitOptions = options.signal === undefined
-            ? { deadlineMs, runtime: this.#runtime, timeoutMs }
-            : { deadlineMs, runtime: this.#runtime, signal: options.signal, timeoutMs };
-        await waitForEndpointAvailability(network, waitOptions);
+        await waitForEndpointAvailability(network, {
+            deadlineMs,
+            runtime: this.#runtime,
+            signal: options.signal,
+            timeoutMs,
+        });
     }
 
     #network(chainId: number): NetworkState<ManagedEndpoint> {
@@ -620,7 +621,7 @@ export class RpcPoolManager {
         }
     }
 
-    #operationOptions(options: RpcExecutionOptions): RpcExecutionOptions {
+    #operationOptions(options: RpcExecutionOptions): OperationOptions {
         const signal = options.signal === undefined
             ? this.#closeController.signal
             : AbortSignal.any([options.signal, this.#closeController.signal]);
@@ -632,7 +633,7 @@ export class RpcPoolManager {
         timeoutMs: number,
         deadlineMs: number,
         operation: (termination: Promise<never>) => Promise<Result>,
-        signal: AbortSignal | undefined,
+        signal: AbortSignal,
     ): Promise<Result> {
         const timeout = new OperationDeadline(this.#runtime, network.chainId, timeoutMs, deadlineMs);
 

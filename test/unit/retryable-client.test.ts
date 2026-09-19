@@ -111,6 +111,16 @@ describe("createRetryableRpcAttempt", () => {
         provider.destroy();
     });
 
+    it("leaves non-provider values returned from guarded collections unchanged", async () => {
+        const provider = createProvider();
+        const value = { index: 1 };
+        vi.spyOn(provider, "getLogs").mockResolvedValue([value as unknown as Log]);
+        const { client } = createRetryableRpcAttempt(provider);
+
+        await expect(client.getLogs({})).resolves.toEqual([value]);
+        provider.destroy();
+    });
+
     it("replaces provider references on all provider-backed result types", async () => {
         const provider = createProvider();
         const block = new Block({

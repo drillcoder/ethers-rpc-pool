@@ -1,6 +1,7 @@
 import { JsonRpcProvider, Wallet } from "ethers";
 import { describe, expect, it, vi } from "vitest";
 
+import type { SingleAttemptRpcClient } from "../../src/index.js";
 import { createSingleRpcAttempt, SingleRpcCallError } from "../../src/pool/single-attempt-client.js";
 import { EndpointReservationUnavailableError } from "../../src/pool/attempt.js";
 import { EndpointJsonRpcProvider } from "../../src/transport/provider.js";
@@ -117,5 +118,40 @@ describe("createSingleRpcAttempt", () => {
 
         provider.destroy();
         expect(destroy).toHaveBeenCalledOnce();
+    });
+
+    it("wraps synchronous failures and preserves synchronous facade results", () => {
+        const provider = createProvider();
+        const failure = new Error("synchronous failure");
+        const extensions = provider as EndpointJsonRpcProvider & {
+            failSynchronously(): never;
+            returnProvider(): EndpointJsonRpcProvider;
+            returnValue(): number;
+        };
+        extensions.failSynchronously = () => {
+            throw failure;
+        };
+        extensions.returnProvider = () => provider;
+        extensions.returnValue = () => 42;
+        const { client } = createSingleRpcAttempt(provider);
+        const facade = client as SingleAttemptRpcClient & typeof extensions;
+
+        expect(() => facade.failSynchronously()).toThrow(new SingleRpcCallError(failure));
+        expect(facade.returnProvider()).toBe(client);
+        expect(facade.returnValue()).toBe(42);
+        provider.destroy();
+    });
+
+    it("replaces a provider resolved by a generic method with the facade", async () => {
+        const provider = createProvider();
+        const extensions = provider as EndpointJsonRpcProvider & {
+            returnProviderAsync(): Promise<EndpointJsonRpcProvider>;
+        };
+        extensions.returnProviderAsync = () => Promise.resolve(provider);
+        const { client } = createSingleRpcAttempt(provider);
+        const facade = client as SingleAttemptRpcClient & typeof extensions;
+
+        await expect(facade.returnProviderAsync()).resolves.toBe(client);
+        provider.destroy();
     });
 });

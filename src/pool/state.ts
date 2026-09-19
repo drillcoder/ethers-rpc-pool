@@ -194,11 +194,14 @@ export function waitForEndpointAvailability(
     return new Promise((resolve, reject) => {
         let timer: TimerHandle | null = null;
         const listeners = networkStateListeners.get(network) ?? new Set<() => void>();
+        const signal = options.signal;
         networkStateListeners.set(network, listeners);
 
         const cleanup = (): void => {
             listeners.delete(evaluate);
-            options.signal?.removeEventListener("abort", abort);
+            if (abort !== null) {
+                signal?.removeEventListener("abort", abort);
+            }
             if (timer !== null) {
                 options.runtime.clearTimeout(timer);
                 timer = null;
@@ -213,10 +216,8 @@ export function waitForEndpointAvailability(
                 reject(error);
             }
         };
-        const abort = (): void => {
-            if (options.signal !== undefined) {
-                settle(options.signal.reason);
-            }
+        const abort = signal === undefined ? null : (): void => {
+            settle(signal.reason);
         };
         function evaluate(): void {
             if (timer !== null) {
@@ -248,8 +249,10 @@ export function waitForEndpointAvailability(
         }
 
         listeners.add(evaluate);
-        options.signal?.addEventListener("abort", abort, { once: true });
-        if (options.signal?.aborted === true) {
+        if (abort !== null) {
+            signal?.addEventListener("abort", abort, { once: true });
+        }
+        if (signal?.aborted === true && abort !== null) {
             abort();
         } else {
             evaluate();
