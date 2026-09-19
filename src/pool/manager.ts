@@ -169,19 +169,25 @@ interface PreviousFailure {
 }
 
 type OperationOptions = Omit<RpcExecutionOptions, "signal"> & { readonly signal: AbortSignal };
+type ExecutionMode = "once" | "retry";
+
+interface ClientAttempt<Client> {
+    readonly client: Client;
+    deactivate(): void | Promise<void>;
+}
 
 class OperationDeadline {
-    public readonly promise: Promise<never>;
+    public readonly signal: AbortSignal;
+    readonly #controller = new AbortController();
     readonly #runtime: RuntimeDependencies;
     #timer!: TimerHandle;
 
     public constructor(runtime: RuntimeDependencies, chainId: number, timeoutMs: number, deadlineMs: number) {
         this.#runtime = runtime;
-        this.promise = new Promise<never>((_resolve, reject) => {
-            this.#timer = runtime.setTimeout(() => {
-                reject(new OperationTimeoutError(chainId, timeoutMs));
-            }, Math.max(0, deadlineMs - runtime.monotonicNow()));
-        });
+        this.signal = this.#controller.signal;
+        this.#timer = runtime.setTimeout(() => {
+            this.#controller.abort(new OperationTimeoutError(chainId, timeoutMs));
+        }, Math.max(0, deadlineMs - runtime.monotonicNow()));
     }
 
     public clear(): void {
@@ -253,28 +259,12 @@ export class RpcPoolManager {
         callback: (client: RetryableRpcClient) => Promise<Result>,
         options: RpcExecutionOptions = {},
     ): Promise<Result> {
-        this.#assertOpen();
-        const network = this.#network(chainId);
-        const timeoutMs = options.timeoutMs ?? this.#operationTimeoutMs;
-        assertOperationTimeout(timeoutMs);
-        options.signal?.throwIfAborted();
-        const operationOptions = this.#operationOptions(options);
-        const deadlineMs = this.#runtime.monotonicNow() + timeoutMs;
-
-        return await this.#withDeadline(
-            network,
-            timeoutMs,
-            deadlineMs,
-            async (termination) =>
-                await this.#executeRetryAttempt(
-                    network,
-                    callback,
-                    operationOptions,
-                    timeoutMs,
-                    deadlineMs,
-                    termination,
-                ),
-            operationOptions.signal,
+        return await this.#execute(
+            chainId,
+            callback,
+            options,
+            "retry",
+            (endpoint, isCurrent) => createRetryableRpcAttempt(endpoint.provider, isCurrent),
         );
     }
 
@@ -283,28 +273,12 @@ export class RpcPoolManager {
         callback: (client: SingleAttemptRpcClient) => Promise<Result>,
         options: RpcExecutionOptions = {},
     ): Promise<Result> {
-        this.#assertOpen();
-        const network = this.#network(chainId);
-        const timeoutMs = options.timeoutMs ?? this.#operationTimeoutMs;
-        assertOperationTimeout(timeoutMs);
-        options.signal?.throwIfAborted();
-        const operationOptions = this.#operationOptions(options);
-        const deadlineMs = this.#runtime.monotonicNow() + timeoutMs;
-
-        return await this.#withDeadline(
-            network,
-            timeoutMs,
-            deadlineMs,
-            async (termination) =>
-                await this.#executeOnceAttempt(
-                    network,
-                    callback,
-                    operationOptions,
-                    timeoutMs,
-                    deadlineMs,
-                    termination,
-                ),
-            operationOptions.signal,
+        return await this.#execute(
+            chainId,
+            callback,
+            options,
+            "once",
+            (endpoint, isCurrent) => createSingleRpcAttempt(endpoint.provider, isCurrent),
         );
     }
 
@@ -359,189 +333,119 @@ export class RpcPoolManager {
         });
     }
 
-    async #executeOnceAttempt<Result>(
-        network: NetworkState<ManagedEndpoint>,
-        callback: (client: SingleAttemptRpcClient) => Promise<Result>,
-        options: OperationOptions,
-        timeoutMs: number,
-        deadlineMs: number,
-        termination: Promise<never>,
-        previousFailure?: PreviousFailure,
+    async #execute<Result, Client>(
+        chainId: number,
+        callback: (client: Client) => Promise<Result>,
+        options: RpcExecutionOptions,
+        mode: ExecutionMode,
+        createAttempt: (endpoint: ManagedEndpoint, isCurrent: () => boolean) => ClientAttempt<Client>,
     ): Promise<Result> {
-        const reservation = reserveEndpoint(network, this.#runtime.monotonicNow());
-        if (reservation === null) {
-            await this.#waitForEndpoint(network, options, timeoutMs, deadlineMs);
-            return await this.#executeOnceAttempt(
-                network,
-                callback,
-                options,
-                timeoutMs,
-                deadlineMs,
-                termination,
-                previousFailure,
-            );
-        }
+        this.#assertOpen();
+        const network = this.#network(chainId);
+        const timeoutMs = options.timeoutMs ?? this.#operationTimeoutMs;
+        assertOperationTimeout(timeoutMs);
+        options.signal?.throwIfAborted();
+        const deadlineMs = this.#runtime.monotonicNow() + timeoutMs;
+        const deadline = new OperationDeadline(this.#runtime, chainId, timeoutMs, deadlineMs);
+        const operationOptions = this.#operationOptions(options, deadline.signal);
 
-        const endpoint = reservation.endpoint;
-        this.#emitSwitch(previousFailure, endpoint);
-        let callbackStarted = false;
         try {
-            const result = await runEndpointReservation(
-                network,
-                reservation,
-                async () => await endpoint.provider.runWithDeadline(deadlineMs, async () => {
-                    await endpoint.verifier.verify();
-                    options.signal.throwIfAborted();
-                    callbackStarted = true;
-                    const attempt = createSingleRpcAttempt(
-                        endpoint.provider,
-                        () => isEndpointReservationCurrent(reservation),
-                    );
-                    try {
-                        return await Promise.race([
-                            raceWithAbort(callback(attempt.client), options.signal),
-                            termination,
-                        ]);
-                    } finally {
-                        await attempt.deactivate();
-                    }
-                }, options.signal),
-                () => undefined,
-            );
-            this.#emitRecovery(reservation.requiresProbe, endpoint);
-            return result;
-        } catch (error: unknown) {
-            options.signal.throwIfAborted();
-            const decision = this.#handleSingleFailure(endpoint, error, callbackStarted);
-            notifyNetworkStateChanged(network);
-            if (!decision.retry) {
-                throw decision.error;
-            }
-            return await this.#executeOnceAttempt(
+            return await this.#executeAttempts(
                 network,
                 callback,
-                options,
+                operationOptions,
                 timeoutMs,
                 deadlineMs,
-                termination,
-                { category: decision.category, endpoint },
+                mode,
+                createAttempt,
             );
+        } finally {
+            deadline.clear();
         }
     }
 
-    async #executeRetryAttempt<Result>(
+    async #executeAttempts<Result, Client>(
         network: NetworkState<ManagedEndpoint>,
-        callback: (client: RetryableRpcClient) => Promise<Result>,
+        callback: (client: Client) => Promise<Result>,
         options: OperationOptions,
         timeoutMs: number,
         deadlineMs: number,
-        termination: Promise<never>,
-        previousFailure?: PreviousFailure,
+        mode: ExecutionMode,
+        createAttempt: (endpoint: ManagedEndpoint, isCurrent: () => boolean) => ClientAttempt<Client>,
     ): Promise<Result> {
-        const reservation = reserveEndpoint(network, this.#runtime.monotonicNow());
-        if (reservation === null) {
-            await this.#waitForEndpoint(network, options, timeoutMs, deadlineMs);
-            return await this.#executeRetryAttempt(
-                network,
-                callback,
-                options,
-                timeoutMs,
-                deadlineMs,
-                termination,
-                previousFailure,
-            );
-        }
-
-        const endpoint = reservation.endpoint;
-        this.#emitSwitch(previousFailure, endpoint);
-        let callbackStarted = false;
-        try {
-            const result = await runEndpointReservation(
-                network,
-                reservation,
-                async () => await endpoint.provider.runWithDeadline(deadlineMs, async () => {
-                    await endpoint.verifier.verify();
-                    options.signal.throwIfAborted();
-                    callbackStarted = true;
-                    const attempt = createRetryableRpcAttempt(
-                        endpoint.provider,
-                        () => isEndpointReservationCurrent(reservation),
-                    );
-                    try {
-                        return await Promise.race([
-                            raceWithAbort(callback(attempt.client), options.signal),
-                            termination,
-                        ]);
-                    } finally {
-                        attempt.deactivate();
-                    }
-                }, options.signal),
-                () => undefined,
-            );
-            this.#emitRecovery(reservation.requiresProbe, endpoint);
-            return result;
-        } catch (error: unknown) {
+        let previousFailure: PreviousFailure | undefined;
+        for (;;) {
             options.signal.throwIfAborted();
-            const decision = this.#handleRetryFailure(endpoint, error, callbackStarted);
-            notifyNetworkStateChanged(network);
-            if (!decision.retry) {
-                throw decision.error;
+            const reservation = reserveEndpoint(network, this.#runtime.monotonicNow());
+            if (reservation === null) {
+                await this.#waitForEndpoint(network, options, timeoutMs, deadlineMs);
+                continue;
             }
-            return await this.#executeRetryAttempt(
-                network,
-                callback,
-                options,
-                timeoutMs,
-                deadlineMs,
-                termination,
-                { category: decision.category, endpoint },
-            );
+
+            const endpoint = reservation.endpoint;
+            this.#emitSwitch(previousFailure, endpoint);
+            let callbackStarted = false;
+            try {
+                const result = await runEndpointReservation(network, reservation, async () =>
+                    await endpoint.provider.runWithDeadline(deadlineMs, async () => {
+                        await endpoint.verifier.verify();
+                        options.signal.throwIfAborted();
+                        callbackStarted = true;
+                        const attempt = createAttempt(
+                            endpoint,
+                            () => isEndpointReservationCurrent(reservation),
+                        );
+                        try {
+                            return await raceWithAbort(callback(attempt.client), options.signal);
+                        } finally {
+                            await attempt.deactivate();
+                        }
+                    }, options.signal));
+                this.#emitRecovery(reservation.requiresProbe, endpoint);
+                return result;
+            } catch (error: unknown) {
+                options.signal.throwIfAborted();
+                const decision = this.#handleFailure(endpoint, error, callbackStarted, mode);
+                notifyNetworkStateChanged(network);
+                if (!decision.retry) {
+                    throw decision.error;
+                }
+                previousFailure = { category: decision.category, endpoint };
+            }
         }
     }
 
-    #handleRetryFailure(endpoint: ManagedEndpoint, error: unknown, callbackStarted: boolean): RetryDecision {
+    #handleFailure(
+        endpoint: ManagedEndpoint,
+        error: unknown,
+        callbackStarted: boolean,
+        mode: ExecutionMode,
+    ): RetryDecision {
         if (error instanceof EndpointReservationUnavailableError) {
-            return { category: "unknown", error, retry: true };
+            return { category: "unknown", error, retry: mode === "retry" };
         }
         if (error instanceof RpcEndpointDataError) {
             recordRpcError(this.#state.counters, endpoint.counters, "endpoint-data");
             const cooldownUntil = applyEndpointDataCooldown(endpoint, this.#runtime.monotonicNow(), this.#runtime);
             this.#emitCooldown(endpoint, "endpoint-data", cooldownUntil);
-            return { category: "endpoint-data", error, retry: true };
+            return { category: "endpoint-data", error, retry: mode === "retry" };
         }
         if (error instanceof RpcChainIdMismatchError) {
             excludeEndpointForChainIdMismatch(endpoint);
             return { category: "endpoint-data", error, retry: true };
         }
-        if (callbackStarted && !(error instanceof RetryableRpcCallError)) {
+        const callError = mode === "retry"
+            ? error instanceof RetryableRpcCallError
+            : error instanceof SingleRpcCallError;
+        if (callbackStarted && !callError) {
             return { category: "unknown", error, retry: false };
         }
 
-        const transportError = error instanceof RetryableRpcCallError ? error.cause : error;
-        return this.#applyTransportFailure(endpoint, transportError);
-    }
-
-    #handleSingleFailure(endpoint: ManagedEndpoint, error: unknown, callbackStarted: boolean): RetryDecision {
-        if (error instanceof EndpointReservationUnavailableError) {
-            return { category: "unknown", error, retry: false };
-        }
-        if (error instanceof RpcEndpointDataError) {
-            recordRpcError(this.#state.counters, endpoint.counters, "endpoint-data");
-            const cooldownUntil = applyEndpointDataCooldown(endpoint, this.#runtime.monotonicNow(), this.#runtime);
-            this.#emitCooldown(endpoint, "endpoint-data", cooldownUntil);
-            return { category: "endpoint-data", error, retry: false };
-        }
-        if (error instanceof RpcChainIdMismatchError) {
-            excludeEndpointForChainIdMismatch(endpoint);
-            return { category: "endpoint-data", error, retry: true };
-        }
-        if (callbackStarted && !(error instanceof SingleRpcCallError)) {
-            return { category: "unknown", error, retry: false };
-        }
-
-        const transportError = error instanceof SingleRpcCallError ? error.cause : error;
+        const transportError = callError && (error instanceof RetryableRpcCallError || error instanceof SingleRpcCallError)
+            ? error.cause
+            : error;
         const decision = this.#applyTransportFailure(endpoint, transportError);
-        return callbackStarted ? { ...decision, retry: false } : decision;
+        return mode === "once" && callbackStarted ? { ...decision, retry: false } : decision;
     }
 
     #applyTransportFailure(endpoint: ManagedEndpoint, transportError: unknown): RetryDecision {
@@ -621,26 +525,11 @@ export class RpcPoolManager {
         }
     }
 
-    #operationOptions(options: RpcExecutionOptions): OperationOptions {
-        const signal = options.signal === undefined
-            ? this.#closeController.signal
-            : AbortSignal.any([options.signal, this.#closeController.signal]);
+    #operationOptions(options: RpcExecutionOptions, deadlineSignal: AbortSignal): OperationOptions {
+        const signals = options.signal === undefined
+            ? [this.#closeController.signal, deadlineSignal]
+            : [options.signal, this.#closeController.signal, deadlineSignal];
+        const signal = AbortSignal.any(signals);
         return { ...options, signal };
-    }
-
-    async #withDeadline<Result>(
-        network: NetworkState,
-        timeoutMs: number,
-        deadlineMs: number,
-        operation: (termination: Promise<never>) => Promise<Result>,
-        signal: AbortSignal,
-    ): Promise<Result> {
-        const timeout = new OperationDeadline(this.#runtime, network.chainId, timeoutMs, deadlineMs);
-
-        try {
-            return await raceWithAbort(operation(timeout.promise), signal);
-        } finally {
-            timeout.clear();
-        }
     }
 }

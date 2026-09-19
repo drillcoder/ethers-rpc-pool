@@ -29,12 +29,12 @@ describe("EndpointChainIdVerifier", () => {
         const provider = createProvider(request);
         const verifier = new EndpointChainIdVerifier(provider, 1);
 
-        expect(verifier.status).toBe("unchecked");
-        await expect(verifier.run(async (verified) => await verified.getBlockNumber())).resolves.toBe(42);
-        await expect(verifier.run(async (verified) => await verified.getBlockNumber())).resolves.toBe(42);
+        await expect(verifier.verify()).resolves.toBeUndefined();
+        await expect(provider.getBlockNumber()).resolves.toBe(42);
+        await expect(verifier.verify()).resolves.toBeUndefined();
+        await expect(provider.getBlockNumber()).resolves.toBe(42);
 
         expect(methods).toEqual(["eth_chainId", "eth_blockNumber"]);
-        expect(verifier.status).toBe("verified");
         provider.destroy();
     });
 
@@ -67,17 +67,14 @@ describe("EndpointChainIdVerifier", () => {
 
     it("permanently excludes a mismatched endpoint without another request", async () => {
         const request = vi.fn<HttpRequest>((_input, init) => Promise.resolve(responseForRequest(init, "0x2")));
-        const operation = vi.fn<() => Promise<void>>(() => Promise.resolve());
         const provider = createProvider(request);
         const verifier = new EndpointChainIdVerifier(provider, 1);
         const mismatch = new RpcChainIdMismatchError(1, 2);
 
-        await expect(verifier.run(operation)).rejects.toEqual(mismatch);
+        await expect(verifier.verify()).rejects.toEqual(mismatch);
         await expect(verifier.verify()).rejects.toEqual(mismatch);
 
         expect(mismatch.excludedReason).toBe("chain-id-mismatch");
-        expect(verifier.status).toBe("excluded");
-        expect(operation).not.toHaveBeenCalled();
         expect(request).toHaveBeenCalledOnce();
         provider.destroy();
     });
@@ -96,10 +93,8 @@ describe("EndpointChainIdVerifier", () => {
             action: "cooldown",
             category: "network",
         });
-        expect(verifier.status).toBe("unchecked");
         await expect(verifier.verify()).resolves.toBeUndefined();
 
-        expect(verifier.status).toBe("verified");
         expect(request).toHaveBeenCalledTimes(2);
         provider.destroy();
     });
@@ -114,8 +109,6 @@ describe("EndpointChainIdVerifier", () => {
             const verifier = new EndpointChainIdVerifier(provider, 1);
 
             await expect(verifier.verify()).rejects.toBeInstanceOf(RpcEndpointDataError);
-            expect(verifier.status).toBe("unchecked");
-
             provider.destroy();
         },
     );

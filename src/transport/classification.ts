@@ -8,8 +8,6 @@ interface RpcErrorClassificationBase {
 
 export interface RpcCooldownClassification extends RpcErrorClassificationBase {
     readonly action: "cooldown";
-    readonly baseDelayMs: number;
-    readonly maxDelayMs: number;
     readonly retryAfterMs?: number;
     readonly retryable: true;
 }
@@ -28,10 +26,6 @@ export type RpcErrorClassification =
     | RpcCooldownClassification
     | RpcExcludeClassification
     | RpcPassThroughClassification;
-
-const shortCooldown = { baseDelayMs: 5_000, maxDelayMs: 60_000 } as const;
-
-const longCooldown = { baseDelayMs: 30_000, maxDelayMs: 300_000 } as const;
 
 const authorizationPattern = /\b(?:access denied|authentication required|forbidden|invalid api key|unauthorized)\b/iu;
 const contractExecutionPattern = /\b(?:execution reverted|revert)\b/iu;
@@ -64,7 +58,6 @@ export function parseRetryAfter(value: string | undefined, nowMs: number): numbe
 
 function cooldown(
     category: RpcErrorCategory,
-    policy: typeof shortCooldown | typeof longCooldown,
     httpStatus: number | null,
     retryAfterMs: number | null = null,
 ): RpcCooldownClassification {
@@ -73,7 +66,6 @@ function cooldown(
         category,
         httpStatus,
         retryable: true,
-        ...policy,
     } as const;
 
     return retryAfterMs === null
@@ -114,14 +106,14 @@ function classifyJsonRpcError(
         jsonRpcLimitSignatures.quotaLimitCodes.includes(error.code) ||
         jsonRpcLimitSignatures.quotaLimitPattern.test(message)
     ) {
-        return cooldown("quota-limit", longCooldown, httpStatus, retryAfterMs);
+        return cooldown("quota-limit", httpStatus, retryAfterMs);
     }
 
     if (
         jsonRpcLimitSignatures.rateLimitCodes.includes(error.code) ||
         jsonRpcLimitSignatures.rateLimitPattern.test(message)
     ) {
-        return cooldown("rate-limit", longCooldown, httpStatus, retryAfterMs);
+        return cooldown("rate-limit", httpStatus, retryAfterMs);
     }
 
     switch (error.code) {
@@ -148,9 +140,9 @@ function classifyHttpResponse(error: RpcTransportResponseError, nowMs: number): 
         case 403:
             return exclude("authorization", error.status);
         case 402:
-            return cooldown("quota-limit", longCooldown, error.status, retryAfterMs);
+            return cooldown("quota-limit", error.status, retryAfterMs);
         case 429:
-            return cooldown("rate-limit", longCooldown, error.status, retryAfterMs);
+            return cooldown("rate-limit", error.status, retryAfterMs);
         default:
             break;
     }
@@ -160,7 +152,7 @@ function classifyHttpResponse(error: RpcTransportResponseError, nowMs: number): 
     }
 
     if (Math.trunc(error.status / 100) === 5) {
-        return cooldown("http-5xx", shortCooldown, error.status, retryAfterMs);
+        return cooldown("http-5xx", error.status, retryAfterMs);
     }
 
     return passThrough("unknown", error.status);
@@ -168,12 +160,12 @@ function classifyHttpResponse(error: RpcTransportResponseError, nowMs: number): 
 
 export function classifyRpcTransportError(error: unknown, nowMs = Date.now()): RpcErrorClassification {
     if (error instanceof RpcRequestTimeoutError) {
-        return cooldown("timeout", shortCooldown, null);
+        return cooldown("timeout", null);
     }
 
     if (error instanceof RpcTransportResponseError) {
         return classifyHttpResponse(error, nowMs);
     }
 
-    return cooldown("network", shortCooldown, null);
+    return cooldown("network", null);
 }

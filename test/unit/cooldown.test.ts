@@ -7,8 +7,9 @@ import {
     excludeEndpointForAuthorization,
     excludeEndpointForChainIdMismatch,
 } from "../../src/pool/cooldown.js";
-import { createPoolState, getEndpointCandidates } from "../../src/pool/state.js";
+import { getEndpointCandidates } from "../../src/pool/state.js";
 import type { EndpointState } from "../../src/pool/state.js";
+import { createPoolState } from "../helpers/pool-state.js";
 
 function createEndpoint(): EndpointState {
     const state = createPoolState([{ chainId: 1, rpcUrls: ["https://rpc.example/"] }]);

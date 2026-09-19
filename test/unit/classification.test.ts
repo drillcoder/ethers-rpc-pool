@@ -24,42 +24,38 @@ function responseError(status: number, code?: number, message?: string): RpcTran
 function expectCooldown(
     error: unknown,
     category: RpcErrorCategory,
-    baseDelayMs: number,
-    maxDelayMs: number,
     httpStatus: number | null,
 ): void {
     expect(classifyRpcTransportError(error)).toEqual({
         action: "cooldown",
-        baseDelayMs,
         category,
         httpStatus,
-        maxDelayMs,
         retryable: true,
     });
 }
 
 describe("classifyRpcTransportError", () => {
     it("classifies request timeouts with the short cooldown policy", () => {
-        expectCooldown(new RpcRequestTimeoutError(500), "timeout", 5_000, 60_000, null);
+        expectCooldown(new RpcRequestTimeoutError(500), "timeout", null);
     });
 
     it("classifies network failures with the short cooldown policy", () => {
-        expectCooldown(new TypeError("fetch failed"), "network", 5_000, 60_000, null);
+        expectCooldown(new TypeError("fetch failed"), "network", null);
     });
 
     it.each([500, 503, 599])(
         "classifies HTTP %s with the short cooldown policy",
         (status) => {
-            expectCooldown(responseError(status), "http-5xx", 5_000, 60_000, status);
+            expectCooldown(responseError(status), "http-5xx", status);
         },
     );
 
     it("classifies HTTP 429 as rate limiting", () => {
-        expectCooldown(responseError(429), "rate-limit", 30_000, 300_000, 429);
+        expectCooldown(responseError(429), "rate-limit", 429);
     });
 
     it("classifies HTTP 402 as quota exhaustion", () => {
-        expectCooldown(responseError(402), "quota-limit", 30_000, 300_000, 402);
+        expectCooldown(responseError(402), "quota-limit", 402);
     });
 
     it.each([401, 403])(
@@ -111,7 +107,7 @@ describe("classifyRpcTransportError", () => {
     ] as const)(
         "classifies JSON-RPC limit code %s and message %s as %s",
         (code, message, category) => {
-            expectCooldown(responseError(200, code, message), category, 30_000, 300_000, 200);
+            expectCooldown(responseError(200, code, message), category, 200);
         },
     );
 
@@ -193,10 +189,8 @@ describe("parseRetryAfter", () => {
 
         expect(classifyRpcTransportError(error, nowMs)).toEqual({
             action: "cooldown",
-            baseDelayMs: 30_000,
             category: "rate-limit",
             httpStatus: 429,
-            maxDelayMs: 300_000,
             retryAfterMs: 600_000,
             retryable: true,
         });
@@ -211,10 +205,8 @@ describe("parseRetryAfter", () => {
 
         expect(classifyRpcTransportError(error, nowMs)).toEqual({
             action: "cooldown",
-            baseDelayMs: 30_000,
             category: "quota-limit",
             httpStatus: 200,
-            maxDelayMs: 300_000,
             retryAfterMs: 60_000,
             retryable: true,
         });

@@ -3,13 +3,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { NoUsableRpcEndpointError, OperationTimeoutError } from "../../src/index.js";
 import { createRuntime } from "../../src/pool/runtime.js";
 import {
-    createPoolState,
     notifyNetworkStateChanged,
     reserveEndpoint,
     runEndpointReservation,
     waitForEndpointAvailability,
 } from "../../src/pool/state.js";
 import type { EndpointState, NetworkState } from "../../src/pool/state.js";
+import { createPoolState } from "../helpers/pool-state.js";
 
 function createNetwork(): NetworkState {
     const network = createPoolState([{
@@ -166,7 +166,7 @@ describe("waitForEndpointAvailability", () => {
         }
 
         const waiting = waitForEndpointAvailability(network, createWaitOptions(500));
-        await runEndpointReservation(network, reservation, () => Promise.resolve(), () => undefined);
+        await runEndpointReservation(network, reservation, () => Promise.resolve());
 
         await expect(waiting).resolves.toBeUndefined();
         expect(vi.getTimerCount()).toBe(0);

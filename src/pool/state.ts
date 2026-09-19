@@ -1,9 +1,7 @@
 import { NoUsableRpcEndpointError, OperationTimeoutError } from "../errors/errors.js";
 import type { EndpointCounters, RpcCounters } from "../observability/counters.js";
-import { createEndpointCounters, createRpcCounters } from "../observability/counters.js";
 import type { RpcEndpointExcludedReason, RpcEndpointStatus } from "../observability/types.js";
 import type { RuntimeDependencies, TimerHandle } from "./runtime.js";
-import type { RpcNetworkConfig } from "./types.js";
 
 const latencyEwmaWeight = 0.2;
 const networkStateListeners = new WeakMap<NetworkState, Set<() => void>>();
@@ -52,49 +50,11 @@ export interface EndpointReservation<Endpoint extends EndpointState = EndpointSt
     readonly version: number;
 }
 
-export type EndpointReservationFailureHandler = (error: unknown, endpoint: EndpointState) => void;
-
 export interface EndpointAvailabilityWaitOptions {
     readonly deadlineMs: number;
     readonly runtime: Pick<RuntimeDependencies, "clearTimeout" | "monotonicNow" | "setTimeout">;
     readonly signal?: AbortSignal;
     readonly timeoutMs: number;
-}
-
-function createEndpointState(rpcUrl: string, endpointNumber: number): EndpointState {
-    return {
-        counters: createEndpointCounters(),
-        endpointNumber,
-        rpcUrl,
-        activeGroups: 0,
-        cooldownUntil: null,
-        excludedReason: null,
-        failureStreaks: {
-            long: 0,
-            short: 0,
-        },
-        latencyEwmaMs: null,
-        probeToken: null,
-        status: "available",
-        version: 0,
-    };
-}
-
-export function createPoolState(networks: readonly RpcNetworkConfig[]): PoolState {
-    return {
-        counters: createRpcCounters(),
-        networks: new Map(
-            networks.map((network) => [
-                network.chainId,
-                {
-                    chainId: network.chainId,
-                    endpoints: network.rpcUrls.map((rpcUrl, index) => createEndpointState(rpcUrl, index + 1)),
-                    activeGroups: 0,
-                    selectionCursor: 0,
-                },
-            ]),
-        ),
-    };
 }
 
 function selectRoundRobin<Endpoint extends EndpointState>(
@@ -294,7 +254,6 @@ export async function runEndpointReservation<Result>(
     network: NetworkState,
     reservation: EndpointReservation,
     operation: () => Promise<Result>,
-    onFailure: EndpointReservationFailureHandler,
 ): Promise<Result> {
     let succeeded = false;
 
@@ -302,9 +261,6 @@ export async function runEndpointReservation<Result>(
         const result = await operation();
         succeeded = true;
         return result;
-    } catch (error: unknown) {
-        onFailure(error, reservation.endpoint);
-        throw error;
     } finally {
         if (succeeded) {
             recoverProbedEndpoint(reservation);
@@ -319,18 +275,4 @@ export function updateEndpointLatency(endpoint: EndpointState, sampleMs: number)
     endpoint.latencyEwmaMs = previous === null
         ? sampleMs
         : latencyEwmaWeight * sampleMs + (1 - latencyEwmaWeight) * previous;
-}
-
-export async function runMeasuredEndpointCall<Result>(
-    endpoint: EndpointState,
-    runtime: Pick<RuntimeDependencies, "monotonicNow">,
-    operation: () => Promise<Result>,
-): Promise<Result> {
-    const startedAt = runtime.monotonicNow();
-
-    try {
-        return await operation();
-    } finally {
-        updateEndpointLatency(endpoint, runtime.monotonicNow() - startedAt);
-    }
 }

@@ -2,15 +2,15 @@ import { describe, expect, it } from "vitest";
 
 import { applyShortCooldown, excludeEndpointForAuthorization } from "../../src/pool/cooldown.js";
 import {
-    createPoolState,
     getEndpointCandidates,
     isEndpointReservationCurrent,
     reserveEndpoint,
     runEndpointReservation,
-    runMeasuredEndpointCall,
     selectEndpointCandidate,
+    updateEndpointLatency,
 } from "../../src/pool/state.js";
 import type { EndpointReservation, EndpointState, NetworkState } from "../../src/pool/state.js";
+import { createPoolState } from "../helpers/pool-state.js";
 
 const networks = [
     { chainId: 1, rpcUrls: ["https://first.example/", "https://second.example/"] },
@@ -290,7 +290,7 @@ describe("candidate inspection and reservation", () => {
             throw new Error("Expected probe reservation");
         }
 
-        await expect(runEndpointReservation(network, reservation, () => Promise.resolve("recovered"), () => undefined))
+        await expect(runEndpointReservation(network, reservation, () => Promise.resolve("recovered")))
             .resolves.toBe("recovered");
         expect(endpoint.status).toBe("available");
         expect(endpoint.cooldownUntil).toBeNull();
@@ -308,7 +308,7 @@ describe("candidate inspection and reservation", () => {
             throw new Error("Expected ordinary reservation");
         }
 
-        await expect(runEndpointReservation(network, reservation, () => Promise.resolve(42), () => undefined))
+        await expect(runEndpointReservation(network, reservation, () => Promise.resolve(42)))
             .resolves.toBe(42);
         expect(reservation.endpoint.status).toBe("available");
         expect(reservation.endpoint.activeGroups).toBe(0);
@@ -338,8 +338,13 @@ describe("candidate inspection and reservation", () => {
             throw new Error("Expected probe reservation");
         }
 
-        await expect(runEndpointReservation(network, reservation, () => Promise.reject(error), (_error, failed) => {
-            applyShortCooldown(failed, 100, { random: () => 0 });
+        await expect(runEndpointReservation(network, reservation, async () => {
+            try {
+                return await Promise.reject(error);
+            } catch (failure: unknown) {
+                applyShortCooldown(endpoint, 100, { random: () => 0 });
+                throw failure;
+            }
         })).rejects.toBe(error);
         expect(endpoint.status).toBe("cooling-down");
         expect(endpoint.cooldownUntil).toBe(10_100);
@@ -349,11 +354,10 @@ describe("candidate inspection and reservation", () => {
         expect(network.activeGroups).toBe(0);
     });
 
-    it("releases the probe slot when failure handling throws during cancellation", async () => {
+    it("releases the probe slot when the operation rejects during cancellation", async () => {
         const network = createNetwork();
         const endpoint = network.endpoints[0];
         const cancellation = new DOMException("Cancelled", "AbortError");
-        const handlerError = new Error("failure handler failed");
 
         if (endpoint === undefined) {
             throw new Error("Expected test endpoint");
@@ -372,9 +376,8 @@ describe("candidate inspection and reservation", () => {
             throw new Error("Expected probe reservation");
         }
 
-        await expect(runEndpointReservation(network, reservation, () => Promise.reject(cancellation), () => {
-            throw handlerError;
-        })).rejects.toBe(handlerError);
+        await expect(runEndpointReservation(network, reservation, () => Promise.reject(cancellation)))
+            .rejects.toBe(cancellation);
         expect(endpoint.status).toBe("cooling-down");
         expect(endpoint.probeToken).toBeNull();
         expect(endpoint.activeGroups).toBe(0);
@@ -385,7 +388,7 @@ describe("candidate inspection and reservation", () => {
         const { endpoint, network, reservation } = reserveExpiredProbe();
 
         applyShortCooldown(endpoint, 200, { random: () => 0 });
-        await runEndpointReservation(network, reservation, () => Promise.resolve(), () => undefined);
+        await runEndpointReservation(network, reservation, () => Promise.resolve());
 
         expect(endpoint.status).toBe("cooling-down");
         expect(endpoint.cooldownUntil).toBe(5_200);
@@ -397,7 +400,7 @@ describe("candidate inspection and reservation", () => {
         const { endpoint, network, reservation } = reserveExpiredProbe();
 
         excludeEndpointForAuthorization(endpoint);
-        await runEndpointReservation(network, reservation, () => Promise.resolve(), () => undefined);
+        await runEndpointReservation(network, reservation, () => Promise.resolve());
 
         expect(endpoint.status).toBe("excluded");
         expect(endpoint.excludedReason).toBe("authorization");
@@ -410,7 +413,7 @@ describe("candidate inspection and reservation", () => {
         const replacementToken = Symbol("replacement-probe");
 
         endpoint.probeToken = replacementToken;
-        await runEndpointReservation(network, reservation, () => Promise.resolve(), () => undefined);
+        await runEndpointReservation(network, reservation, () => Promise.resolve());
 
         expect(endpoint.status).toBe("probe");
         expect(endpoint.cooldownUntil).toBe(100);
@@ -421,48 +424,25 @@ describe("candidate inspection and reservation", () => {
         const { endpoint, network, reservation } = reserveExpiredProbe();
 
         endpoint.status = "excluded";
-        await runEndpointReservation(network, reservation, () => Promise.resolve(), () => undefined);
+        await runEndpointReservation(network, reservation, () => Promise.resolve());
 
         expect(endpoint.status).toBe("excluded");
         expect(endpoint.probeToken).toBeNull();
     });
 });
 
-describe("runMeasuredEndpointCall", () => {
-    it("uses the first monotonic duration as the initial EWMA and smooths later samples", async () => {
+describe("updateEndpointLatency", () => {
+    it("uses the first sample as the initial EWMA and smooths later samples", () => {
         const network = createNetwork();
         const endpoint = network.endpoints[0];
-        const times = [10, 110, 200, 400];
 
         if (endpoint === undefined) {
             throw new Error("Expected test endpoint");
         }
 
-        const runtime = { monotonicNow: () => times.shift() ?? 0 };
-
-        await expect(runMeasuredEndpointCall(endpoint, runtime, () => Promise.resolve("first"))).resolves.toBe("first");
+        updateEndpointLatency(endpoint, 100);
         expect(endpoint.latencyEwmaMs).toBe(100);
-
-        const secondCall = runMeasuredEndpointCall(endpoint, runtime, () => Promise.resolve("second"));
-        await expect(secondCall).resolves.toBe("second");
+        updateEndpointLatency(endpoint, 200);
         expect(endpoint.latencyEwmaMs).toBe(120);
-    });
-
-    it("records the duration of a rejected transport call", async () => {
-        const network = createNetwork();
-        const endpoint = network.endpoints[0];
-        const times = [50, 125];
-        const error = new Error("transport failed");
-
-        if (endpoint === undefined) {
-            throw new Error("Expected test endpoint");
-        }
-
-        await expect(runMeasuredEndpointCall(
-            endpoint,
-            { monotonicNow: () => times.shift() ?? 0 },
-            async () => await Promise.reject(error),
-        )).rejects.toBe(error);
-        expect(endpoint.latencyEwmaMs).toBe(75);
     });
 });

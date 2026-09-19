@@ -1,8 +1,6 @@
 import { RpcEndpointDataError } from "../errors/errors.js";
 import type { EndpointJsonRpcProvider } from "./provider.js";
 
-export type ChainIdVerificationStatus = "unchecked" | "verified" | "excluded";
-
 function createMismatchMessage(expectedChainId: number, actualChainId: number): string {
     return `RPC endpoint uses chain ID ${String(actualChainId)} instead of expected `
         + `chain ID ${String(expectedChainId)}`;
@@ -44,19 +42,6 @@ export class EndpointChainIdVerifier {
     public constructor(provider: EndpointJsonRpcProvider, expectedChainId: number) {
         this.#provider = provider;
         this.#expectedChainId = expectedChainId;
-    }
-
-    public get status(): ChainIdVerificationStatus {
-        if (this.#mismatch !== undefined) {
-            return "excluded";
-        }
-
-        return this.#verified ? "verified" : "unchecked";
-    }
-
-    public async run<Result>(operation: (provider: EndpointJsonRpcProvider) => Promise<Result>): Promise<Result> {
-        await this.verify();
-        return await operation(this.#provider);
     }
 
     public async verify(): Promise<void> {
