@@ -1,0 +1,24 @@
+name: Checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Quality gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Build pinned toolchain image
+        run: docker build --tag ethers-rpc-pool-quality .
+
+      - name: Run hermetic quality gate
+        run: docker run --rm --network none ethers-rpc-pool-quality
