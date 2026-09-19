@@ -151,6 +151,21 @@ controller.abort(new Error("Request cancelled by the caller"));
 await operation;
 ```
 
+## Important execution semantics
+
+- `executeWithRetry()` retries the entire callback, not only the failed RPC request. Any side effect performed by
+  your callback outside the RPC client can therefore happen more than once. Keep the whole callback idempotent.
+- Once an `executeOnce()` callback starts, the pool never runs it again. This prevents automatic duplicate writes,
+  but does not guarantee exactly-once delivery.
+- If a write reaches the RPC server but its response is lost, `executeOnce()` returns an error even though the write
+  may have succeeded. Its result is unknown; inspect the chain or application state before deciding whether to retry.
+- An endpoint that returns an HTTP or JSON-RPC authorization error remains excluded for the lifetime of the manager.
+  Fix the credentials and create a new `RpcPoolManager` to use that endpoint again.
+- Cancellation stops pool-managed waits and requests and settles the public promise promptly. It cannot forcibly stop
+  synchronous code or other work started by a callback that does not cooperate with cancellation. Such code may keep
+  running, but its pool client is deactivated and its eventual settlement is ignored. A blocked JavaScript event loop
+  also delays cancellation handling.
+
 ## Snapshots, logging, and metrics
 
 `getSnapshot()` returns an immutable view of request counters, categorized errors, active groups, latency EWMA,
