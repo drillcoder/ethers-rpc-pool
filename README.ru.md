@@ -17,13 +17,13 @@ npm install @drillcoder/ethers-rpc-pool ethers
 
 `RpcPoolManager` владеет своими provider и таймерами. Всегда закрывайте его, желательно в `finally`:
 
-```ts
+```ts runnable
 import { RpcPoolManager } from "@drillcoder/ethers-rpc-pool";
 
 const pool = new RpcPoolManager({
     networks: [{
         chainId: 1,
-        rpcUrls: ["https://ethereum-rpc.publicnode.com", "https://eth.llamarpc.com"],
+        rpcUrls: ["http://127.0.0.1:8545"],
     }],
     requestTimeoutMs: 10_000,
     operationTimeoutMs: 30_000,

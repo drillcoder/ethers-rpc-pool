@@ -17,13 +17,13 @@ Node.js 22 or newer and ethers v6 are required. The package is ESM-only.
 
 `RpcPoolManager` owns its providers and timers. Always close it, preferably in `finally`:
 
-```ts
+```ts runnable
 import { RpcPoolManager } from "@drillcoder/ethers-rpc-pool";
 
 const pool = new RpcPoolManager({
     networks: [{
         chainId: 1,
-        rpcUrls: ["https://ethereum-rpc.publicnode.com", "https://eth.llamarpc.com"],
+        rpcUrls: ["http://127.0.0.1:8545"],
     }],
     requestTimeoutMs: 10_000,
     operationTimeoutMs: 30_000,

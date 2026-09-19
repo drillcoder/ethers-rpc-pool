@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { once } from "node:events";
 import { mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const temporaryRoot = path.join(root, "test/package/.tmp");
@@ -63,15 +66,37 @@ assert.deepEqual(installedMetadata.exports, {
 });
 assert.equal(installedMetadata.publishConfig.access, "public");
 
+const readmes = await Promise.all([
+    readFile(path.join(installedPackageRoot, "README.md"), "utf8"),
+    readFile(path.join(installedPackageRoot, "README.ru.md"), "utf8"),
+]);
+const readmeExamples = readmes.map(extractTypeScriptExamples);
+assert(readmeExamples.every((examples) => examples.length > 0));
+for (const examples of readmeExamples) {
+    for (const { code } of examples) {
+        const result = ts.transpileModule(code, {
+            compilerOptions: { module: ts.ModuleKind.NodeNext, target: ts.ScriptTarget.ES2022 },
+            reportDiagnostics: true,
+        });
+        assert.equal(
+            result.diagnostics?.filter(({ category }) => category === ts.DiagnosticCategory.Error).length ?? 0,
+            0,
+        );
+    }
+}
+const runnableExamples = readmeExamples.map((examples) => examples.filter(({ runnable }) => runnable));
+assert(runnableExamples.every((examples) => examples.length === 1));
+assert.equal(runnableExamples[0][0].code, runnableExamples[1][0].code);
+
 await writeJson(path.join(projectRoot, "tsconfig.json"), {
     compilerOptions: {
         module: "NodeNext",
         moduleResolution: "NodeNext",
-        noEmit: true,
+        outDir: "compiled",
         strict: true,
         target: "ES2022",
     },
-    include: ["index.ts"],
+    include: ["*.ts"],
 });
 await writeFile(path.join(projectRoot, "index.ts"), `
 import { RpcPoolManager } from "${packageName}";
@@ -100,10 +125,28 @@ const values: [
 void values;
 await manager.close();
 `);
+const readmeServer = createReadmeRpcServer();
+readmeServer.listen(0, "127.0.0.1");
+await once(readmeServer, "listening");
+const readmeAddress = readmeServer.address();
+assert(readmeAddress !== null && typeof readmeAddress === "object");
+const readmeExample = runnableExamples[0][0].code.replace(
+    "http://127.0.0.1:8545",
+    `http://127.0.0.1:${String(readmeAddress.port)}`,
+);
+await writeFile(path.join(projectRoot, "readme-example.ts"), readmeExample);
 execFileSync(path.join(root, "node_modules/.bin/tsc"), ["--project", "tsconfig.json"], {
     cwd: projectRoot,
     stdio: "pipe",
 });
+try {
+    await runReadmeExample();
+} finally {
+    await new Promise((resolve, reject) => readmeServer.close((error) => {
+        if (error === undefined) resolve();
+        else reject(error);
+    }));
+}
 
 const publicApi = await import(packageName);
 assert.deepEqual(Object.keys(publicApi).sort(), runtimeExports);
@@ -138,4 +181,41 @@ async function listFiles(directory, prefix = "") {
 
 async function writeJson(filePath, value) {
     await writeFile(filePath, `${JSON.stringify(value, null, 4)}\n`);
+}
+
+function extractTypeScriptExamples(readme) {
+    return [...readme.matchAll(/^```ts( runnable)?\n([\s\S]*?)^```$/gmu)].map((match) => ({
+        code: match[2],
+        runnable: match[1] !== undefined,
+    }));
+}
+
+function createReadmeRpcServer() {
+    /**
+     * @param {import("node:http").IncomingMessage} request
+     * @param {import("node:http").ServerResponse} response
+     */
+    const handleRequest = (request, response) => {
+        let body = "";
+        request.setEncoding("utf8");
+        request.on("data", (chunk) => {
+            body += chunk;
+        });
+        request.on("end", () => {
+            const payload = JSON.parse(body);
+            const result = payload.method === "eth_chainId" ? "0x1" : "0x2a";
+            response.writeHead(200, { "content-type": "application/json" });
+            response.end(JSON.stringify({ id: payload.id, jsonrpc: "2.0", result }));
+        });
+    };
+    return createServer(handleRequest);
+}
+
+async function runReadmeExample() {
+    await new Promise((resolve, reject) => {
+        execFile(process.execPath, ["compiled/readme-example.js"], { cwd: projectRoot }, (error) => {
+            if (error === null) resolve();
+            else reject(error);
+        });
+    });
 }
