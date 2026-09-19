@@ -1,3 +1,4 @@
+import { Wallet, keccak256 } from "ethers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -244,6 +245,7 @@ describe("RpcPoolManager operation entry points", () => {
                 chainId: 1,
                 rpcUrls: ["https://first.example", "https://second.example"],
             }],
+            operationTimeoutMs: 10_000,
         });
         const first = manager.executeOnce(1, async (client) => {
             await client.send("debug_first", []);
@@ -1251,6 +1253,80 @@ describe("RpcPoolManager operation entry points", () => {
         expect(callback).toHaveBeenCalledOnce();
         expect(methods.get("https://first.example/")).toEqual(["eth_chainId", "eth_sendRawTransaction"]);
         expect(methods.has("https://second.example/")).toBe(false);
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]?.status).toBe("cooling-down");
+    });
+
+    it("supports broadcastTransaction and a connected Signer only in single-attempt callbacks", async () => {
+        const sentTransactions: string[] = [];
+        vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+            const payload = JSON.parse(init?.body as string) as { id: number; method: string; params: string[] };
+            if (payload.method === "eth_chainId") {
+                return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x1" }));
+            }
+            if (payload.method === "eth_blockNumber") {
+                return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x2a" }));
+            }
+            if (payload.method === "eth_getTransactionCount") {
+                return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x1" }));
+            }
+            const signedTransaction = payload.params[0];
+            if (payload.method !== "eth_sendRawTransaction" || signedTransaction === undefined) {
+                throw new Error(`Unexpected RPC method: ${payload.method}`);
+            }
+            sentTransactions.push(signedTransaction);
+            return Promise.resolve(Response.json({
+                id: payload.id,
+                jsonrpc: "2.0",
+                result: keccak256(signedTransaction),
+            }));
+        }));
+        const manager = new RpcPoolManager(config);
+        const wallet = new Wallet("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        const transaction = {
+            chainId: 1,
+            gasLimit: 21_000n,
+            gasPrice: 1n,
+            to: "0x0000000000000000000000000000000000000001",
+            type: 0,
+            value: 0n,
+        } as const;
+        const signedTransaction = await wallet.signTransaction({ ...transaction, nonce: 0 });
+        const broadcastCallback = vi.fn(async (client: SingleAttemptRpcClient) =>
+            await client.broadcastTransaction(signedTransaction));
+        const signerCallback = vi.fn(async (client: SingleAttemptRpcClient) =>
+            await wallet.connect(client).getNonce("latest"));
+
+        await expect(manager.executeOnce(1, broadcastCallback)).resolves.toMatchObject({ nonce: 0 });
+        await expect(manager.executeOnce(1, signerCallback)).resolves.toBe(1);
+        expect(broadcastCallback).toHaveBeenCalledOnce();
+        expect(signerCallback).toHaveBeenCalledOnce();
+        expect(sentTransactions).toHaveLength(1);
+        await manager.close();
+    });
+
+    it("keeps events and destroy local to an executeOnce facade", async () => {
+        vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) =>
+            Promise.resolve(rpcResponse(init ?? {}))));
+        const on = vi.spyOn(EndpointJsonRpcProvider.prototype, "on").mockResolvedValue({} as EndpointJsonRpcProvider);
+        const off = vi.spyOn(EndpointJsonRpcProvider.prototype, "off").mockResolvedValue({} as EndpointJsonRpcProvider);
+        const destroy = vi.spyOn(EndpointJsonRpcProvider.prototype, "destroy");
+        const manager = new RpcPoolManager(config);
+        const listener = vi.fn();
+
+        await manager.executeOnce(1, async (client) => {
+            await client.on("block", listener);
+            client.destroy();
+            await expect(client.send("debug_after_destroy", [])).rejects.toThrow(
+                "RPC client attempt is no longer active",
+            );
+        });
+
+        expect(on).toHaveBeenCalledWith("block", listener);
+        expect(off).toHaveBeenCalledWith("block", listener);
+        expect(destroy).not.toHaveBeenCalled();
+        await expect(manager.executeOnce(1, () => Promise.resolve("still active"))).resolves.toBe("still active");
+        await manager.close();
+        expect(destroy).toHaveBeenCalledOnce();
     });
 
     it("cools endpoint data failures without retrying a started single callback", async () => {
