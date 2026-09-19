@@ -8,6 +8,7 @@ export interface RpcServerRequest {
 }
 
 export interface RpcServerResponse {
+    readonly closed: Promise<void>;
     disconnect(): void;
     hang(): void;
     json(payload: unknown, options?: RpcServerResponseOptions): void;
@@ -31,12 +32,14 @@ export interface RpcTestServer {
 }
 
 class ResponseController implements RpcServerResponse {
+    readonly closed: Promise<void>;
     readonly #request: IncomingMessage;
     readonly #response: ServerResponse;
 
     constructor(request: IncomingMessage, response: ServerResponse) {
         this.#request = request;
         this.#response = response;
+        this.closed = new Promise((resolve) => response.once("close", resolve));
     }
 
     disconnect(): void {
@@ -130,6 +133,18 @@ export async function createRpcTestServer(): Promise<RpcTestServer> {
     });
     const address = server.address() as AddressInfo;
     return new LocalRpcTestServer(server, address.port);
+}
+
+export function enqueueRpcResult(server: RpcTestServer, result: unknown): void {
+    server.enqueue((request, response) => {
+        response.json({ id: rpcRequestId(request), jsonrpc: "2.0", result });
+    });
+}
+
+export function rpcRequestId(request: RpcServerRequest): unknown {
+    return typeof request.payload === "object" && request.payload !== null && "id" in request.payload
+        ? request.payload.id
+        : null;
 }
 
 async function readBody(request: IncomingMessage): Promise<string> {

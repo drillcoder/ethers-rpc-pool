@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { RpcPoolManager } from "../../src/index.js";
 import type { RetryableRpcClient } from "../../src/index.js";
-import { createRpcTestServer } from "./rpc-server.js";
-import type { RpcServerRequest, RpcTestServer } from "./rpc-server.js";
+import { createRpcTestServer, enqueueRpcResult, rpcRequestId } from "./rpc-server.js";
+import type { RpcTestServer } from "./rpc-server.js";
 
 interface FailureCase {
     readonly category: string;
@@ -62,18 +62,18 @@ describe("RPC transport failure matrix", () => {
         const first = await createRpcTestServer();
         const second = await createRpcTestServer();
         servers.push(first, second);
-        enqueueResult(first, "0x1");
+        enqueueRpcResult(first, "0x1");
         first.enqueue((request, response) => {
             const body = failure.error === undefined
-                ? { id: requestId(request), jsonrpc: "2.0", result: "rejected" }
-                : { error: failure.error, id: requestId(request), jsonrpc: "2.0" };
+                ? { id: rpcRequestId(request), jsonrpc: "2.0", result: "rejected" }
+                : { error: failure.error, id: rpcRequestId(request), jsonrpc: "2.0" };
             response.json(body, {
                 ...(failure.headers === undefined ? {} : { headers: failure.headers }),
                 status: failure.status,
             });
         });
-        enqueueResult(second, "0x1");
-        enqueueResult(second, "0x2a");
+        enqueueRpcResult(second, "0x1");
+        enqueueRpcResult(second, "0x2a");
         const startedAt = Date.now();
         const manager = new RpcPoolManager({
             networks: [{ chainId: 1, rpcUrls: [first.url, second.url] }],
@@ -104,15 +104,15 @@ describe("RPC transport failure matrix", () => {
         const second = await createRpcTestServer();
         servers.push(first, second);
         const retryAt = Date.now() + 120_000;
-        enqueueResult(first, "0x1");
+        enqueueRpcResult(first, "0x1");
         first.enqueue((request, response) => {
             response.json(
-                { id: requestId(request), jsonrpc: "2.0", result: "limited" },
+                { id: rpcRequestId(request), jsonrpc: "2.0", result: "limited" },
                 { headers: { "retry-after": new Date(retryAt).toUTCString() }, status: 429 },
             );
         });
-        enqueueResult(second, "0x1");
-        enqueueResult(second, "0x2a");
+        enqueueRpcResult(second, "0x1");
+        enqueueRpcResult(second, "0x2a");
         const manager = new RpcPoolManager({
             networks: [{ chainId: 1, rpcUrls: [first.url, second.url] }],
             operationTimeoutMs: 2_000,
@@ -127,15 +127,3 @@ describe("RPC transport failure matrix", () => {
         await manager.close();
     });
 });
-
-function enqueueResult(server: RpcTestServer, result: string): void {
-    server.enqueue((request, response) => {
-        response.json({ id: requestId(request), jsonrpc: "2.0", result });
-    });
-}
-
-function requestId(request: RpcServerRequest): unknown {
-    return typeof request.payload === "object" && request.payload !== null && "id" in request.payload
-        ? request.payload.id
-        : null;
-}
