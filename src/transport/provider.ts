@@ -8,6 +8,7 @@ import type {
     Networkish,
 } from "ethers";
 
+import { EndpointReservationUnavailableError } from "../pool/attempt.js";
 import { createRuntime } from "../pool/runtime.js";
 import type { RuntimeDependencies } from "../pool/runtime.js";
 
@@ -30,8 +31,32 @@ export interface RpcTransportObserver {
 }
 
 interface RequestContext {
+    readonly active: () => boolean;
+    readonly controller: AbortController;
     readonly deadlineMs: number;
+    readonly isReservationCurrent: () => boolean;
     readonly signal?: AbortSignal;
+}
+
+const rpcOriginErrors = new WeakSet();
+const rpcOriginCauses = new WeakMap<object, unknown>();
+
+function markRpcOrigin(error: object, cause: unknown = error): void {
+    rpcOriginErrors.add(error);
+    rpcOriginCauses.set(error, cause);
+}
+
+export function getRpcOriginError(error: unknown): unknown {
+    let current = error;
+    const visited = new Set<object>();
+    while (typeof current === "object" && current !== null && !visited.has(current)) {
+        if (rpcOriginErrors.has(current)) {
+            return rpcOriginCauses.get(current);
+        }
+        visited.add(current);
+        current = "cause" in current ? current.cause : undefined;
+    }
+    return undefined;
 }
 
 export class RpcTransportResponseError extends Error {
@@ -70,6 +95,7 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
     readonly #requestTimeoutMs: number;
     readonly #runtime: RuntimeDependencies;
     readonly #url: string;
+    #nextId = 1;
 
     public constructor(
         url: string,
@@ -78,6 +104,7 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
     ) {
         super(url, network, {
             batchMaxCount: 1,
+            cacheTimeout: -1,
             staticNetwork: true,
         });
 
@@ -88,13 +115,50 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
         this.#runtime = createRuntime(options.runtime);
     }
 
-    public runWithDeadline<Result>(
+    public async runWithDeadline<Result>(
         deadlineMs: number,
         operation: () => Promise<Result>,
         signal?: AbortSignal,
+        isReservationCurrent: () => boolean = () => true,
     ): Promise<Result> {
-        const context = signal === undefined ? { deadlineMs } : { deadlineMs, signal };
-        return this.#context.run(context, operation);
+        let active = true;
+        const controller = new AbortController();
+        const context: RequestContext = {
+            active: () => active,
+            controller,
+            deadlineMs,
+            isReservationCurrent,
+            ...(signal === undefined ? {} : { signal }),
+        };
+        try {
+            return await this.#context.run(context, operation);
+        } finally {
+            active = false;
+            controller.abort(new Error("RPC attempt context is no longer active"));
+        }
+    }
+
+    public override async send(method: string, params: unknown[] | Record<string, unknown>): Promise<unknown> {
+        this._start();
+        const payload: JsonRpcPayload = {
+            id: this.#nextId++,
+            jsonrpc: "2.0",
+            method,
+            params,
+        };
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- _send returns one response per payload.
+        const response = (await this._send(payload))[0]!;
+        if ("error" in response) {
+            const error = this.getRpcError(payload, response as JsonRpcError);
+            const transportError = new RpcTransportResponseError(
+                200,
+                Object.freeze({}),
+                Object.freeze({ ...(response as JsonRpcError).error }),
+            );
+            markRpcOrigin(error, transportError);
+            throw error;
+        }
+        return response.result;
     }
 
     public override async _send(payload: JsonRpcPayload | JsonRpcPayload[]): Promise<JsonRpcResult[]> {
@@ -107,6 +171,13 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
 
     async #sendOne(payload: JsonRpcPayload): Promise<JsonRpcResult> {
         const context = this.#context.getStore();
+        if (context !== undefined) {
+            context.signal?.throwIfAborted();
+            context.controller.signal.throwIfAborted();
+            if (!context.active() || !context.isReservationCurrent()) {
+                throw new EndpointReservationUnavailableError();
+            }
+        }
         const deadlineMs = context?.deadlineMs;
         const remainingMs =
             deadlineMs === undefined
@@ -122,6 +193,21 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
         try {
             const result = await this.#requestPayload(payload, context, remainingMs);
             const finishedAt = this.#runtime.epochNow();
+            if ("error" in result) {
+                const transportError = new RpcTransportResponseError(
+                    200,
+                    Object.freeze({}),
+                    Object.freeze({ ...(result as JsonRpcError).error }),
+                );
+                this.#observer?.onError(
+                    payload.method,
+                    transportError,
+                    startedAt,
+                    finishedAt,
+                    this.#runtime.monotonicNow() - startedMonotonic,
+                );
+                return result;
+            }
             this.#observer?.onResponse(
                 payload.method,
                 startedAt,
@@ -130,6 +216,9 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
             );
             return result;
         } catch (error: unknown) {
+            if (typeof error === "object" && error !== null) {
+                markRpcOrigin(error);
+            }
             const finishedAt = this.#runtime.epochNow();
             this.#observer?.onError(
                 payload.method,
@@ -150,13 +239,11 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
         const timeoutMs = Math.min(this.#requestTimeoutMs, remainingMs);
         const controller = new AbortController();
         const abort = (): void => {
-            controller.abort(context?.signal?.reason);
+            controller.abort(context?.signal?.reason ?? context?.controller.signal.reason);
         };
-        if (context?.signal?.aborted === true) {
-            abort();
-        } else {
-            context?.signal?.addEventListener("abort", abort, { once: true });
-        }
+        const attemptSignal = context?.controller.signal;
+        context?.signal?.addEventListener("abort", abort, { once: true });
+        attemptSignal?.addEventListener("abort", abort, { once: true });
         const timeout = this.#runtime.setTimeout(() => {
             controller.abort(new RpcRequestTimeoutError(timeoutMs));
         }, timeoutMs);
@@ -187,7 +274,7 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
             }
 
             const jsonRpcError = (body as Partial<JsonRpcError>).error;
-            if (!response.ok || jsonRpcError !== undefined) {
+            if (!response.ok) {
                 throw new RpcTransportResponseError(
                     response.status,
                     headers,
@@ -200,6 +287,7 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
             return body as JsonRpcResult;
         } finally {
             context?.signal?.removeEventListener("abort", abort);
+            attemptSignal?.removeEventListener("abort", abort);
             this.#runtime.clearTimeout(timeout);
         }
     }

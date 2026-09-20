@@ -2,8 +2,9 @@
 
 🇬🇧 English | [🇷🇺 Русский](README.ru.md)
 
-A resilient TypeScript JSON-RPC endpoint pool for ethers v6 and Node.js. It balances concurrent operations,
-cools down unhealthy endpoints, excludes invalid credentials or chain IDs, and exposes sanitized diagnostics.
+A resilient JSON-RPC endpoint pool for ethers v6 and Node.js. It selects an endpoint for each operation, tracks
+latency and load, retries eligible operations, applies cooldowns after temporary failures, and permanently excludes
+endpoints with invalid authorization or chain IDs.
 
 ## Installation
 
@@ -11,11 +12,9 @@ cools down unhealthy endpoints, excludes invalid credentials or chain IDs, and e
 npm install @drillcoder/ethers-rpc-pool ethers
 ```
 
-Node.js 22 or newer and ethers v6 are required. The package is ESM-only.
+Requirements: Node.js 22 or newer, ethers v6, and ESM.
 
-## Create and close a pool
-
-`RpcPoolManager` owns its providers and timers. Always close it, preferably in `finally`:
+## Creating a pool
 
 ```ts runnable
 import { RpcPoolManager } from "@drillcoder/ethers-rpc-pool";
@@ -37,56 +36,60 @@ try {
 }
 ```
 
-When provided, `timeoutMs` becomes the operation's total time limit instead of the manager's `operationTimeoutMs`.
-This limit covers endpoint validation, callback execution, retries, and cooldown waits.
+`requestTimeoutMs` limits one HTTP request. `operationTimeoutMs` limits the complete operation, including chain ID
+verification, callback execution, retries, cooldown waits, and endpoint switching. An individual operation can set a
+different total limit with `{ timeoutMs }`.
 
-## Retryable reads
+`RpcPoolManager` owns its endpoint providers and must be closed when it is no longer needed.
 
-Use `executeWithRetry()` for a group of read-only requests. One endpoint is pinned for the whole attempt. After a
-retryable endpoint failure, the pool can run the callback again on another endpoint within the operation deadline.
+## Retried operations
+
+`executeWithRetry()` is intended for callbacks that may safely run again from the beginning. One endpoint remains
+pinned for the duration of each attempt. A retryable endpoint failure starts a new attempt on an eligible endpoint
+within the original operation deadline.
 
 ```ts
 const account = "0x0000000000000000000000000000000000000000";
 
 const state = await pool.executeWithRetry(
     1,
-    async (client) => {
+    async (provider) => {
         const [blockNumber, balance, transactionCount] = await Promise.all([
-            client.getBlockNumber(),
-            client.getBalance(account),
-            client.getTransactionCount(account),
+            provider.getBlockNumber(),
+            provider.getBalance(account),
+            provider.getTransactionCount(account),
         ]);
+
         return { balance, blockNumber, transactionCount };
     },
     { timeoutMs: 15_000 },
 );
 ```
 
-`RetryableRpcClient` exposes the complete standard read, simulation, name-resolution, and wait API supported by the
-pool:
+The callback receives an ethers `JsonRpcProvider` with its complete API, including contracts, signers, events, and
+raw JSON-RPC calls:
 
-- `getNetwork()`, `getBlockNumber()`, `getBlock()`
-- `getBalance()`, `getTransactionCount()`, `getCode()`, `getStorage()`
-- `getFeeData()`, `getLogs()`
-- `getTransaction()`, `getTransactionReceipt()`, `getTransactionResult()`
-- `call()`, `estimateGas()`
-- `resolveName()`, `lookupAddress()`
-- `waitForBlock()`, `waitForTransaction()`
+```ts
+const blockHex = await pool.executeWithRetry(
+    1,
+    async (provider) => await provider.send("eth_blockNumber", []),
+);
+```
 
-It intentionally has no transaction broadcasting, raw JSON-RPC, subscriptions, or lifecycle methods.
+The entire callback is the retry unit. Application side effects performed inside it must therefore be safe to repeat.
 
-## Single-attempt writes
+## Single-attempt operations
 
-Use `executeOnce()` for state-changing operations. Its client is compatible with ethers v6 `JsonRpcProvider`,
-including `broadcastTransaction()`, raw `send()`, events, and connected signers.
+`executeOnce()` starts the callback once. Use it for transaction submission and other operations whose result may be
+unsafe to reproduce automatically.
 
 ```ts
 import { Wallet } from "ethers";
 
 const wallet = new Wallet(process.env.PRIVATE_KEY!);
 
-const transaction = await pool.executeOnce(1, async (client) => {
-    const signer = wallet.connect(client);
+const transaction = await pool.executeOnce(1, async (provider) => {
+    const signer = wallet.connect(provider);
     return await signer.sendTransaction({
         to: "0x000000000000000000000000000000000000dEaD",
         value: 1n,
@@ -96,54 +99,69 @@ const transaction = await pool.executeOnce(1, async (client) => {
 console.log(transaction.hash);
 ```
 
-Raw signed transactions can be sent in this mode with `client.broadcastTransaction(signedTransaction)`.
+If a write reaches the RPC server and the response is lost, the returned operation fails while the on-chain result is
+unknown. Inspect the chain or application state before deciding whether to submit it again.
 
-## Errors
+## Provider lifetime and listeners
 
-Public errors are regular classes, so narrow them with `instanceof`:
+Each endpoint has one shared `JsonRpcProvider` owned by the manager. Completing a callback leaves that provider and
+its listeners active. Remove listeners that your code adds:
 
 ```ts
-import {
-    NoUsableRpcEndpointError,
-    OperationTimeoutError,
-    RpcEndpointDataError,
-    RpcPoolClosedError,
-    UnknownNetworkError,
-} from "@drillcoder/ethers-rpc-pool";
+await pool.executeOnce(1, async (provider) => {
+    const listener = (blockNumber: number): void => {
+        console.log(blockNumber);
+    };
 
-try {
-    await pool.executeWithRetry(1, async (client) => {
-        const block = await client.getBlock("latest");
-        if (block === null) throw new RpcEndpointDataError("Latest block is missing");
-        return block;
-    });
-} catch (error) {
-    if (error instanceof UnknownNetworkError) {
-        console.error("The chain is not configured", error.chainId);
-    } else if (error instanceof NoUsableRpcEndpointError) {
-        console.error("Every endpoint is permanently excluded", error.chainId);
-    } else if (error instanceof OperationTimeoutError) {
-        console.error("The operation timed out", error.timeoutMs);
-    } else if (error instanceof RpcPoolClosedError) {
-        console.error("The pool is closed");
-    } else {
-        throw error;
+    await provider.on("block", listener);
+    try {
+        return await provider.getBlockNumber();
+    } finally {
+        await provider.off("block", listener);
     }
-}
+});
 ```
 
-Throw `RpcEndpointDataError` when an endpoint returned structurally valid but unusable data. The pool will treat that
-endpoint as temporarily unhealthy.
+Calling `destroy()` or changing provider-wide settings affects every user of that endpoint provider. A provider saved
+and later used outside an execution callback sends requests directly to its fixed endpoint. Such calls use the
+transport request timeout and observability, but do not participate in pool selection, retries, active groups, or an
+earlier operation deadline.
 
-## Cancellation
+An execution context closes when its attempt finishes. Asynchronous work that inherited that closed context cannot
+start another managed HTTP request. This boundary applies to network requests; JavaScript work already started by the
+callback continues according to normal JavaScript semantics.
 
-Both execution modes accept an `AbortSignal`. The returned promise rejects with the signal reason when one is set.
+## Endpoint selection
+
+Primary `executeWithRetry()` operations first collect a real latency measurement from every free, eligible endpoint.
+No separate warmup request is sent.
+
+After initial measurement, normal selection minimizes:
+
+```text
+latencyEwmaMs × (activeGroups + 1)
+```
+
+Exact ties use round-robin order. Cooling, excluded, and occupied probe endpoints are filtered before ranking.
+
+Every twentieth primary `executeWithRetry()` reservation is an exploration opportunity. When a free eligible
+alternative exists, the pool chooses the endpoint that has gone longest without a reservation. Otherwise it uses the
+normal winner and consumes that exploration position. Retries, cooldown waits, initial measurements, and
+`executeOnce()` do not advance this counter.
+
+Exploration uses the caller's real operation. It does not create background timers, additional callbacks, or duplicate
+HTTP requests. Selection is a routing heuristic and does not guarantee a particular latency, block freshness, or
+transaction inclusion time.
+
+## Cancellation and errors
+
+Both execution methods accept an `AbortSignal`:
 
 ```ts
 const controller = new AbortController();
 const operation = pool.executeWithRetry(
     1,
-    async (client) => await client.waitForBlock(20_000),
+    async (provider) => await provider.waitForBlock(20_000),
     { signal: controller.signal },
 );
 
@@ -151,39 +169,40 @@ controller.abort(new Error("Request cancelled by the caller"));
 await operation;
 ```
 
-## Important execution semantics
+The package exports these error classes:
 
-- `executeWithRetry()` retries the entire callback, not only the failed RPC request. Any side effect performed by
-  your callback outside the RPC client can therefore happen more than once. Keep the whole callback idempotent.
-- Once an `executeOnce()` callback starts, the pool never runs it again. This prevents automatic duplicate writes,
-  but does not guarantee exactly-once delivery.
-- If a write reaches the RPC server but its response is lost, `executeOnce()` returns an error even though the write
-  may have succeeded. Its result is unknown; inspect the chain or application state before deciding whether to retry.
-- An endpoint that returns an HTTP or JSON-RPC authorization error remains excluded for the lifetime of the manager.
-  Fix the credentials and create a new `RpcPoolManager` to use that endpoint again.
-- Cancellation stops pool-managed waits and requests and settles the public promise promptly. It cannot forcibly stop
-  synchronous code or other work started by a callback that does not cooperate with cancellation. Such code may keep
-  running, but its pool client is deactivated and its eventual settlement is ignored. A blocked JavaScript event loop
-  also delays cancellation handling.
+- `UnknownNetworkError` — the requested chain ID is not configured.
+- `NoUsableRpcEndpointError` — every endpoint for the network is permanently excluded.
+- `OperationTimeoutError` — the total operation deadline expired.
+- `RpcPoolClosedError` — an operation was started after the manager closed.
+- `RpcEndpointDataError` — application code rejected structurally valid but unusable endpoint data.
 
-## Snapshots, logging, and metrics
+An HTTP or JSON-RPC authorization failure permanently excludes that endpoint for the lifetime of the manager.
+Temporary transport failures use cooldown and recovery rules. Local callback errors pass through without changing
+endpoint health.
 
-`getSnapshot()` returns an immutable view of request counters, categorized errors, active groups, latency EWMA,
-cooldowns, and endpoint status. Endpoint identifiers are sanitized.
+## Snapshot and logger
+
+`getSnapshot()` returns an immutable view of counters, active groups, endpoint status, cooldown deadlines, and latency
+EWMA.
 
 ```ts
 const snapshot = pool.getSnapshot();
-console.log(snapshot.totalRequests, snapshot.errorsByCategory);
 
 for (const network of snapshot.networks) {
     for (const endpoint of network.endpoints) {
-        console.log(network.chainId, endpoint.endpointId, endpoint.status, endpoint.latencyEwmaMs);
+        console.log({
+            chainId: network.chainId,
+            endpointNumber: endpoint.endpointNumber,
+            hostname: endpoint.hostname,
+            status: endpoint.status,
+            latencyEwmaMs: endpoint.latencyEwmaMs,
+        });
     }
 }
 ```
 
-The logger receives `request`, `response`, `error`, `switch`, `cooldown`, and `recovery` events. A small adapter can
-turn them into metrics without coupling the pool to a monitoring library:
+The optional logger receives `request`, `response`, `error`, `switch`, `cooldown`, and `recovery` events:
 
 ```ts
 import { RpcPoolManager, type RpcPoolLoggerEvent } from "@drillcoder/ethers-rpc-pool";
@@ -200,36 +219,27 @@ const monitoredPool = new RpcPoolManager({
     operationTimeoutMs: 30_000,
     logger: recordMetric,
 });
-
-try {
-    await monitoredPool.executeWithRetry(1, async (client) => await client.getBlockNumber());
-} finally {
-    await monitoredPool.close();
-}
 ```
 
-Logger failures are isolated from RPC operations. Endpoint IDs and error fields are sanitized before delivery.
+An endpoint is identified by `(chainId, endpointNumber, hostname)`. `hostname` is exactly
+`new URL(rpcUrl).hostname`: it excludes userinfo, port, path, query, and fragment. Subdomains are preserved and may
+contain an account identifier or internal name. The pool logger does not include the full URL, request or response
+bodies, or external error text. Logger failures do not affect RPC execution.
 
-## Development scripts
+## Development
 
-- `npm run build` — compile ESM JavaScript, declarations, declaration maps, and source maps.
-- `npm run typecheck` — type-check production code and compile-time API tests without emitting files.
-- `npm run lint` — run ESLint with zero warnings allowed.
-- `npm run lint:fix` — apply safe ESLint fixes.
-- `npm test` — run the hermetic Vitest suite.
-- `npm run test:coverage` — run tests and verify 100% coverage for statements, branches, functions, and lines.
-- `npm run pack:test` — build, pack, install, and verify the npm artifact in a clean ESM project.
-- `npm run quality` — run the complete canonical quality gate.
+- `npm run build` — build ESM JavaScript and TypeScript declarations.
+- `npm run typecheck` — type-check source and compile-time API tests.
+- `npm run lint` — run ESLint with zero warnings.
+- `npm test` — run the Vitest suite.
+- `npm run test:coverage` — run tests with 100% coverage thresholds.
+- `npm run pack:test` — verify the installed npm tarball and runnable README example.
+- `npm run quality` — run the complete quality gate.
 
-## Docker quality gate
-
-The complete quality gate requires only Docker on the host. It uses the pinned Node.js and npm versions and needs no
-external RPC service:
+The canonical quality gate can run with Docker and requires no Node.js installation or external RPC service on the
+host:
 
 ```sh
 docker build --tag ethers-rpc-pool-quality .
-docker run --rm ethers-rpc-pool-quality
+docker run --rm --network none ethers-rpc-pool-quality
 ```
-
-The container runs `npm run quality`: build, type checking, linting, hermetic tests, 100% coverage, and the package
-smoke-test.

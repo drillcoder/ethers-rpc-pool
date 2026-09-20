@@ -24,7 +24,7 @@ export type RpcEndpointExcludedReason =
 
 export interface RpcEndpointSnapshot {
     readonly endpointNumber: number;
-    readonly endpointId: string;
+    readonly hostname: string;
     readonly status: RpcEndpointStatus;
     readonly excludedReason: RpcEndpointExcludedReason;
     readonly activeGroups: number;
@@ -54,7 +54,7 @@ interface RpcPoolLoggerEventBase {
     readonly timestamp: number;
     readonly chainId: number;
     readonly endpointNumber: number;
-    readonly endpointId: string;
+    readonly hostname: string;
 }
 
 interface RpcTransportLoggerEventBase extends RpcPoolLoggerEventBase {
@@ -85,7 +85,7 @@ export interface RpcSwitchLoggerEvent extends RpcPoolLoggerEventBase {
     readonly type: "switch";
     readonly category: RpcErrorCategory;
     readonly nextEndpointNumber: number;
-    readonly nextEndpointId: string;
+    readonly nextHostname: string;
 }
 
 export interface RpcCooldownLoggerEvent extends RpcPoolLoggerEventBase {

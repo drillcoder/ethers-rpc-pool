@@ -36,7 +36,6 @@ export class EndpointChainIdVerifier {
     readonly #expectedChainId: number;
     readonly #provider: EndpointJsonRpcProvider;
     #mismatch: RpcChainIdMismatchError | undefined;
-    #verification: Promise<void> | undefined;
     #verified = false;
 
     public constructor(provider: EndpointJsonRpcProvider, expectedChainId: number) {
@@ -53,18 +52,6 @@ export class EndpointChainIdVerifier {
             return;
         }
 
-        this.#verification ??= this.#check().catch((error: unknown) => {
-            if (!(error instanceof RpcChainIdMismatchError)) {
-                this.#verification = undefined;
-            }
-
-            throw error;
-        });
-
-        await this.#verification;
-    }
-
-    async #check(): Promise<void> {
         const actualChainId = parseChainId(await this.#provider.send("eth_chainId", []));
         if (actualChainId !== this.#expectedChainId) {
             this.#mismatch = new RpcChainIdMismatchError(this.#expectedChainId, actualChainId);

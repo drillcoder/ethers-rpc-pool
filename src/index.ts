@@ -7,11 +7,9 @@ export {
 } from "./errors/errors.js";
 export { RpcPoolManager } from "./pool/manager.js";
 export type {
-    RetryableRpcClient,
     RpcExecutionOptions,
     RpcNetworkConfig,
     RpcPoolManagerConfig,
-    SingleAttemptRpcClient,
 } from "./pool/types.js";
 export type {
     RpcCooldownLoggerEvent,

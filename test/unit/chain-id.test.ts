@@ -34,19 +34,17 @@ describe("EndpointChainIdVerifier", () => {
         await expect(verifier.verify()).resolves.toBeUndefined();
         await expect(provider.getBlockNumber()).resolves.toBe(42);
 
-        expect(methods).toEqual(["eth_chainId", "eth_blockNumber"]);
+        expect(methods).toEqual(["eth_chainId", "eth_blockNumber", "eth_blockNumber"]);
         provider.destroy();
     });
 
-    it("shares one in-flight check between concurrent first users", async () => {
-        let requestId = 0;
-        let resolveRequest: (response: Response) => void = () => undefined;
+    it("keeps concurrent first checks independent", async () => {
+        const requests: { id: number; resolve: (response: Response) => void }[] = [];
         const request = vi.fn<HttpRequest>(
             (_input, init) =>
                 new Promise((resolve) => {
                     const payload = JSON.parse(init.body as string) as { id: number; method: string };
-                    requestId = payload.id;
-                    resolveRequest = resolve;
+                    requests.push({ id: payload.id, resolve });
                     expect(payload.method).toBe("eth_chainId");
                 }),
         );
@@ -56,12 +54,14 @@ describe("EndpointChainIdVerifier", () => {
         const first = verifier.verify();
         const second = verifier.verify();
         await vi.waitFor(() => {
-            expect(request).toHaveBeenCalledOnce();
+            expect(request).toHaveBeenCalledTimes(2);
         });
-        resolveRequest(Response.json({ id: requestId, jsonrpc: "2.0", result: "0x1" }));
+        for (const pending of requests) {
+            pending.resolve(Response.json({ id: pending.id, jsonrpc: "2.0", result: "0x1" }));
+        }
 
         await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
-        expect(request).toHaveBeenCalledOnce();
+        expect(request).toHaveBeenCalledTimes(2);
         provider.destroy();
     });
 

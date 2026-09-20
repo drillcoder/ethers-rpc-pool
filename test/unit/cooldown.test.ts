@@ -31,7 +31,14 @@ describe("applyShortCooldown", () => {
         expect(endpoint.status).toBe("cooling-down");
         expect(endpoint.cooldownUntil).toBe(6_000);
         expect(endpoint.failureStreaks).toEqual({ long: 0, short: 1 });
-        expect(getEndpointCandidates({ chainId: 1, endpoints: [endpoint], activeGroups: 0, selectionCursor: 0 }, 5_999))
+        expect(getEndpointCandidates({
+            activeGroups: 0,
+            chainId: 1,
+            endpoints: [endpoint],
+            primaryRetrySelections: 0,
+            reservationClock: 0,
+            selectionCursor: 0,
+        }, 5_999))
             .toEqual([]);
         expect(random).toHaveBeenCalledOnce();
     });
@@ -84,7 +91,14 @@ describe("applyLongCooldown", () => {
 describe("authorization and endpoint-data failures", () => {
     it("permanently excludes an unauthorized endpoint without a recovery deadline", () => {
         const endpoint = createEndpoint();
-        const network = { chainId: 1, endpoints: [endpoint], activeGroups: 0, selectionCursor: 0 };
+        const network = {
+            activeGroups: 0,
+            chainId: 1,
+            endpoints: [endpoint],
+            primaryRetrySelections: 0,
+            reservationClock: 0,
+            selectionCursor: 0,
+        };
 
         endpoint.cooldownUntil = 10_000;
         excludeEndpointForAuthorization(endpoint);

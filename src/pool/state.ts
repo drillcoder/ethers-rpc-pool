@@ -22,6 +22,7 @@ export interface EndpointState {
     excludedReason: RpcEndpointExcludedReason;
     readonly failureStreaks: EndpointFailureStreaks;
     latencyEwmaMs: number | null;
+    lastReserved: number;
     probeToken: EndpointProbeToken | null;
     status: RpcEndpointStatus;
     version: number;
@@ -31,8 +32,12 @@ export interface NetworkState<Endpoint extends EndpointState = EndpointState> {
     readonly chainId: number;
     readonly endpoints: readonly Endpoint[];
     activeGroups: number;
+    primaryRetrySelections: number;
+    reservationClock: number;
     selectionCursor: number;
 }
+
+export type EndpointSelectionMode = "once" | "retry";
 
 export interface PoolState<Endpoint extends EndpointState = EndpointState> {
     readonly counters: RpcCounters;
@@ -95,16 +100,18 @@ export function selectEndpointCandidate<Endpoint extends EndpointState>(
         return null;
     }
 
-    const minimumActiveGroups = Math.min(...candidates.map(({ endpoint }) => endpoint.activeGroups));
-    const leastActive = candidates.filter(({ endpoint }) => endpoint.activeGroups === minimumActiveGroups);
-    let preferred = leastActive.filter(({ endpoint }) => endpoint.latencyEwmaMs === null);
-
-    if (preferred.length === 0) {
-        const measured = leastActive as readonly (EndpointCandidate<Endpoint> & {
-            endpoint: { latencyEwmaMs: number };
-        })[];
-        const minimumLatency = Math.min(...measured.map(({ endpoint }) => endpoint.latencyEwmaMs));
-        preferred = leastActive.filter(({ endpoint }) => endpoint.latencyEwmaMs === minimumLatency);
+    const measured = candidates.filter((candidate): candidate is EndpointCandidate<Endpoint> & {
+        endpoint: Endpoint & { latencyEwmaMs: number };
+    } => candidate.endpoint.latencyEwmaMs !== null);
+    let preferred: readonly EndpointCandidate<Endpoint>[];
+    if (measured.length > 0) {
+        const score = (endpoint: Endpoint & { latencyEwmaMs: number }): number =>
+            endpoint.latencyEwmaMs * (endpoint.activeGroups + 1);
+        const minimumScore = Math.min(...measured.map(({ endpoint }) => score(endpoint)));
+        preferred = measured.filter(({ endpoint }) => score(endpoint) === minimumScore);
+    } else {
+        const minimumActiveGroups = Math.min(...candidates.map(({ endpoint }) => endpoint.activeGroups));
+        preferred = candidates.filter(({ endpoint }) => endpoint.activeGroups === minimumActiveGroups);
     }
 
     return selectRoundRobin(network, preferred);
@@ -113,10 +120,34 @@ export function selectEndpointCandidate<Endpoint extends EndpointState>(
 export function reserveEndpoint<Endpoint extends EndpointState>(
     network: NetworkState<Endpoint>,
     nowMs: number,
+    mode: EndpointSelectionMode = "once",
+    primaryAttempt = false,
 ): EndpointReservation<Endpoint> | null {
-    const selected = selectEndpointCandidate(network, getEndpointCandidates(network, nowMs));
+    const candidates = getEndpointCandidates(network, nowMs);
+    const coldCandidates = mode === "retry" && primaryAttempt
+        ? candidates.filter(({ endpoint, requiresProbe }) =>
+            !requiresProbe && endpoint.latencyEwmaMs === null && endpoint.activeGroups === 0)
+        : [];
+    let selected = coldCandidates.length > 0
+        ? selectRoundRobin(network, coldCandidates)
+        : selectEndpointCandidate(network, candidates);
     if (selected === null) {
         return null;
+    }
+
+    if (mode === "retry" && primaryAttempt && coldCandidates.length === 0) {
+        network.primaryRetrySelections += 1;
+        if (network.primaryRetrySelections % 20 === 0) {
+            const alternatives = candidates.filter(({ endpoint, requiresProbe }) =>
+                !requiresProbe && endpoint !== selected?.endpoint && endpoint.activeGroups === 0);
+            if (alternatives.length > 0) {
+                const oldest = Math.min(...alternatives.map(({ endpoint }) => endpoint.lastReserved));
+                selected = selectRoundRobin(
+                    network,
+                    alternatives.filter(({ endpoint }) => endpoint.lastReserved === oldest),
+                );
+            }
+        }
     }
 
     const probeToken = selected.requiresProbe ? Symbol("endpoint-probe") : null;
@@ -126,6 +157,8 @@ export function reserveEndpoint<Endpoint extends EndpointState>(
     }
 
     network.selectionCursor = selected.endpoint.endpointNumber % network.endpoints.length;
+    network.reservationClock += 1;
+    selected.endpoint.lastReserved = network.reservationClock;
     selected.endpoint.activeGroups += 1;
     network.activeGroups += 1;
     return { ...selected, probeToken, version: selected.endpoint.version };

@@ -30,6 +30,8 @@ describe("createPoolState", () => {
         expect(state.networks.get(1)).toEqual({
             chainId: 1,
             activeGroups: 0,
+            primaryRetrySelections: 0,
+            reservationClock: 0,
             selectionCursor: 0,
             endpoints: [
                 {
@@ -40,6 +42,7 @@ describe("createPoolState", () => {
                     cooldownUntil: null,
                     excludedReason: null,
                     failureStreaks: { long: 0, short: 0 },
+                    lastReserved: 0,
                     latencyEwmaMs: null,
                     probeToken: null,
                     status: "available",
@@ -53,6 +56,7 @@ describe("createPoolState", () => {
                     cooldownUntil: null,
                     excludedReason: null,
                     failureStreaks: { long: 0, short: 0 },
+                    lastReserved: 0,
                     latencyEwmaMs: null,
                     probeToken: null,
                     status: "available",
@@ -126,7 +130,7 @@ function reserveExpiredProbe(): {
 }
 
 describe("reserveEndpoint", () => {
-    it("reserves the least-active endpoint before considering latency", () => {
+    it("minimizes latency multiplied by active groups plus one", () => {
         const network = createNetwork();
         const first = network.endpoints[0];
         const second = network.endpoints[1];
@@ -135,13 +139,17 @@ describe("reserveEndpoint", () => {
             throw new Error("Expected test endpoints");
         }
 
-        first.activeGroups = 1;
-        first.latencyEwmaMs = 10;
+        first.activeGroups = 2;
+        first.latencyEwmaMs = 20;
         second.latencyEwmaMs = 100;
 
-        expect(reserveEndpoint(network, 0)?.endpoint).toBe(second);
-        expect(second.activeGroups).toBe(1);
+        expect(reserveEndpoint(network, 0)?.endpoint).toBe(first);
+        expect(first.activeGroups).toBe(3);
         expect(network.activeGroups).toBe(1);
+
+        first.activeGroups = 5;
+        network.activeGroups = 0;
+        expect(reserveEndpoint(network, 0)?.endpoint).toBe(second);
     });
 
     it("reserves the lowest-latency endpoint when load is equal", () => {
@@ -159,7 +167,7 @@ describe("reserveEndpoint", () => {
         expect(reserveEndpoint(network, 0)?.endpoint).toBe(second);
     });
 
-    it("uses round-robin to sample every endpoint during cold start", () => {
+    it("uses primary retry reservations to sample every endpoint during cold start", () => {
         const network = createNetwork();
         const first = network.endpoints[0];
         const second = network.endpoints[1];
@@ -168,11 +176,11 @@ describe("reserveEndpoint", () => {
             throw new Error("Expected test endpoints");
         }
 
-        expect(reserveEndpoint(network, 0)?.endpoint).toBe(first);
+        expect(reserveEndpoint(network, 0, "retry", true)?.endpoint).toBe(first);
         first.activeGroups = 0;
         first.latencyEwmaMs = 1;
         network.activeGroups = 0;
-        expect(reserveEndpoint(network, 0)?.endpoint).toBe(second);
+        expect(reserveEndpoint(network, 0, "retry", true)?.endpoint).toBe(second);
     });
 
     it("uses round-robin when measured latency is equal", () => {
@@ -190,6 +198,69 @@ describe("reserveEndpoint", () => {
         first.activeGroups = 0;
         network.activeGroups = 0;
         expect(reserveEndpoint(network, 0)?.endpoint).toBe(second);
+    });
+
+    it("explores only every twentieth measured primary retry reservation", () => {
+        const network = createNetwork();
+        const first = network.endpoints[0];
+        const second = network.endpoints[1];
+        if (first === undefined || second === undefined) throw new Error("Expected test endpoints");
+        first.latencyEwmaMs = 10;
+        second.latencyEwmaMs = 100;
+
+        const selected: number[] = [];
+        for (let position = 1; position <= 40; position += 1) {
+            const reservation = reserveEndpoint(network, 0, "retry", true);
+            if (reservation === null) throw new Error("Expected reservation");
+            selected.push(reservation.endpoint.endpointNumber);
+            reservation.endpoint.activeGroups = 0;
+            network.activeGroups = 0;
+        }
+
+        expect(selected.filter((endpointNumber) => endpointNumber === 2)).toHaveLength(2);
+        expect(selected[19]).toBe(2);
+        expect(selected[39]).toBe(2);
+        expect(network.reservationClock).toBe(40);
+    });
+
+    it("consumes an exploration position when no free alternative exists", () => {
+        const network = createNetwork();
+        const first = network.endpoints[0];
+        const second = network.endpoints[1];
+        if (first === undefined || second === undefined) throw new Error("Expected test endpoints");
+        first.latencyEwmaMs = 10;
+        second.latencyEwmaMs = 100;
+        second.activeGroups = 1;
+        network.activeGroups = 1;
+        network.primaryRetrySelections = 19;
+
+        expect(reserveEndpoint(network, 0, "retry", true)?.endpoint).toBe(first);
+        expect(network.primaryRetrySelections).toBe(20);
+        first.activeGroups = 0;
+        second.activeGroups = 0;
+        network.activeGroups = 0;
+        expect(reserveEndpoint(network, 0, "retry", true)?.endpoint).toBe(first);
+        expect(network.primaryRetrySelections).toBe(21);
+    });
+
+    it("does not advance exploration for once, retry attempts, or cold start", () => {
+        const network = createNetwork();
+        const first = network.endpoints[0];
+        const second = network.endpoints[1];
+        if (first === undefined || second === undefined) throw new Error("Expected test endpoints");
+
+        expect(reserveEndpoint(network, 0, "retry", true)?.endpoint).toBe(first);
+        first.activeGroups = 0;
+        network.activeGroups = 0;
+        expect(network.primaryRetrySelections).toBe(0);
+        first.latencyEwmaMs = 10;
+        second.latencyEwmaMs = 20;
+        reserveEndpoint(network, 0, "once", true);
+        first.activeGroups = 0;
+        second.activeGroups = 0;
+        network.activeGroups = 0;
+        reserveEndpoint(network, 0, "retry", false);
+        expect(network.primaryRetrySelections).toBe(0);
     });
 
     it("returns null when no endpoint is available", () => {

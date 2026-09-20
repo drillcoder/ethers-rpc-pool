@@ -1,3 +1,5 @@
+import type { JsonRpcProvider } from "ethers";
+
 import {
     OperationTimeoutError,
     RpcEndpointDataError,
@@ -10,11 +12,10 @@ import {
     recordRpcError,
     recordRpcRequest,
 } from "../observability/counters.js";
-import { sanitizeEndpointUrl } from "../observability/sanitizer.js";
 import type { RpcErrorCategory, RpcPoolLogger, RpcPoolLoggerEvent, RpcPoolSnapshot } from "../observability/types.js";
 import { EndpointChainIdVerifier, RpcChainIdMismatchError } from "../transport/chain-id.js";
 import { classifyRpcTransportError } from "../transport/classification.js";
-import { EndpointJsonRpcProvider } from "../transport/provider.js";
+import { EndpointJsonRpcProvider, getRpcOriginError } from "../transport/provider.js";
 import { normalizeManagerConfig } from "./config.js";
 import { EndpointReservationUnavailableError } from "./attempt.js";
 import {
@@ -24,10 +25,8 @@ import {
     excludeEndpointForAuthorization,
     excludeEndpointForChainIdMismatch,
 } from "./cooldown.js";
-import { createRetryableRpcAttempt, RetryableRpcCallError } from "./retryable-client.js";
 import { createRuntime } from "./runtime.js";
 import type { RuntimeDependencies, TimerHandle } from "./runtime.js";
-import { createSingleRpcAttempt, SingleRpcCallError } from "./single-attempt-client.js";
 import {
     isEndpointReservationCurrent,
     notifyNetworkStateChanged,
@@ -38,10 +37,8 @@ import {
 } from "./state.js";
 import type { EndpointFailureStreaks, EndpointState, NetworkState, PoolState } from "./state.js";
 import type {
-    RetryableRpcClient,
     RpcExecutionOptions,
     RpcPoolManagerConfig,
-    SingleAttemptRpcClient,
 } from "./types.js";
 
 class ManagedEndpoint implements EndpointState {
@@ -51,13 +48,14 @@ class ManagedEndpoint implements EndpointState {
     public excludedReason: EndpointState["excludedReason"] = null;
     public readonly failureStreaks: EndpointFailureStreaks = { long: 0, short: 0 };
     public latencyEwmaMs: number | null = null;
+    public lastReserved = 0;
     public probeToken: EndpointState["probeToken"] = null;
     public readonly provider: EndpointJsonRpcProvider;
     public status: EndpointState["status"] = "available";
     public readonly verifier: EndpointChainIdVerifier;
     public version = 0;
     readonly #chainId: number;
-    readonly #endpointId: string;
+    public readonly hostname: string;
     readonly #logger: RpcPoolLogger | undefined;
     readonly #runtime: RuntimeDependencies;
 
@@ -71,7 +69,7 @@ class ManagedEndpoint implements EndpointState {
         logger: RpcPoolLogger | undefined,
     ) {
         this.#chainId = chainId;
-        this.#endpointId = sanitizeEndpointUrl(rpcUrl);
+        this.hostname = new URL(rpcUrl).hostname;
         this.#logger = logger;
         this.#runtime = runtime;
         this.provider = new EndpointJsonRpcProvider(rpcUrl, chainId, {
@@ -115,13 +113,9 @@ class ManagedEndpoint implements EndpointState {
         this.#emit(event);
     }
 
-    public get endpointId(): string {
-        return this.#endpointId;
-    }
-
     public eventBase<Type extends RpcPoolLoggerEvent["type"]>(type: Type): {
         readonly chainId: number;
-        readonly endpointId: string;
+        readonly hostname: string;
         readonly endpointNumber: number;
         readonly timestamp: number;
         readonly type: Type;
@@ -132,7 +126,7 @@ class ManagedEndpoint implements EndpointState {
     #baseEvent<Type extends RpcPoolLoggerEvent["type"]>(type: Type, timestamp: number) {
         return {
             chainId: this.#chainId,
-            endpointId: this.#endpointId,
+            hostname: this.hostname,
             endpointNumber: this.endpointNumber,
             timestamp,
             type,
@@ -170,11 +164,6 @@ interface PreviousFailure {
 
 type OperationOptions = Omit<RpcExecutionOptions, "signal"> & { readonly signal: AbortSignal };
 type ExecutionMode = "once" | "retry";
-
-interface ClientAttempt<Client> {
-    readonly client: Client;
-    deactivate(): void | Promise<void>;
-}
 
 class OperationDeadline {
     public readonly signal: AbortSignal;
@@ -247,6 +236,8 @@ export class RpcPoolManager {
                     activeGroups: 0,
                     chainId: network.chainId,
                     endpoints,
+                    primaryRetrySelections: 0,
+                    reservationClock: 0,
                     selectionCursor: 0,
                 };
                 return [network.chainId, state];
@@ -256,7 +247,7 @@ export class RpcPoolManager {
 
     public async executeWithRetry<Result>(
         chainId: number,
-        callback: (client: RetryableRpcClient) => Promise<Result>,
+        callback: (provider: JsonRpcProvider) => Promise<Result>,
         options: RpcExecutionOptions = {},
     ): Promise<Result> {
         return await this.#execute(
@@ -264,13 +255,12 @@ export class RpcPoolManager {
             callback,
             options,
             "retry",
-            (endpoint, isCurrent) => createRetryableRpcAttempt(endpoint.provider, isCurrent),
         );
     }
 
     public async executeOnce<Result>(
         chainId: number,
-        callback: (client: SingleAttemptRpcClient) => Promise<Result>,
+        callback: (provider: JsonRpcProvider) => Promise<Result>,
         options: RpcExecutionOptions = {},
     ): Promise<Result> {
         return await this.#execute(
@@ -278,7 +268,6 @@ export class RpcPoolManager {
             callback,
             options,
             "once",
-            (endpoint, isCurrent) => createSingleRpcAttempt(endpoint.provider, isCurrent),
         );
     }
 
@@ -310,7 +299,7 @@ export class RpcPoolManager {
                 cooldownUntil: endpoint.cooldownUntil === null
                     ? null
                     : epochNow + endpoint.cooldownUntil - monotonicNow,
-                endpointId: sanitizeEndpointUrl(endpoint.rpcUrl),
+                hostname: endpoint.hostname,
                 endpointNumber: endpoint.endpointNumber,
                 errorCount: endpoint.counters.errorCount,
                 excludedReason: endpoint.excludedReason,
@@ -333,12 +322,11 @@ export class RpcPoolManager {
         });
     }
 
-    async #execute<Result, Client>(
+    async #execute<Result>(
         chainId: number,
-        callback: (client: Client) => Promise<Result>,
+        callback: (client: EndpointJsonRpcProvider) => Promise<Result>,
         options: RpcExecutionOptions,
         mode: ExecutionMode,
-        createAttempt: (endpoint: ManagedEndpoint, isCurrent: () => boolean) => ClientAttempt<Client>,
     ): Promise<Result> {
         this.#assertOpen();
         const network = this.#network(chainId);
@@ -357,26 +345,25 @@ export class RpcPoolManager {
                 timeoutMs,
                 deadlineMs,
                 mode,
-                createAttempt,
             );
         } finally {
             deadline.clear();
         }
     }
 
-    async #executeAttempts<Result, Client>(
+    async #executeAttempts<Result>(
         network: NetworkState<ManagedEndpoint>,
-        callback: (client: Client) => Promise<Result>,
+        callback: (client: EndpointJsonRpcProvider) => Promise<Result>,
         options: OperationOptions,
         timeoutMs: number,
         deadlineMs: number,
         mode: ExecutionMode,
-        createAttempt: (endpoint: ManagedEndpoint, isCurrent: () => boolean) => ClientAttempt<Client>,
     ): Promise<Result> {
         let previousFailure: PreviousFailure | undefined;
+        let primaryAttempt = true;
         for (;;) {
             options.signal.throwIfAborted();
-            const reservation = reserveEndpoint(network, this.#runtime.monotonicNow());
+            const reservation = reserveEndpoint(network, this.#runtime.monotonicNow(), mode, primaryAttempt);
             if (reservation === null) {
                 await this.#waitForEndpoint(network, options, timeoutMs, deadlineMs);
                 continue;
@@ -391,16 +378,8 @@ export class RpcPoolManager {
                         await endpoint.verifier.verify();
                         options.signal.throwIfAborted();
                         callbackStarted = true;
-                        const attempt = createAttempt(
-                            endpoint,
-                            () => isEndpointReservationCurrent(reservation),
-                        );
-                        try {
-                            return await raceWithAbort(callback(attempt.client), options.signal);
-                        } finally {
-                            await attempt.deactivate();
-                        }
-                    }, options.signal));
+                        return await raceWithAbort(callback(endpoint.provider), options.signal);
+                    }, options.signal, () => isEndpointReservationCurrent(reservation)));
                 this.#emitRecovery(reservation.requiresProbe, endpoint);
                 return result;
             } catch (error: unknown) {
@@ -411,6 +390,7 @@ export class RpcPoolManager {
                     throw decision.error;
                 }
                 previousFailure = { category: decision.category, endpoint };
+                primaryAttempt = false;
             }
         }
     }
@@ -434,16 +414,10 @@ export class RpcPoolManager {
             excludeEndpointForChainIdMismatch(endpoint);
             return { category: "endpoint-data", error, retry: true };
         }
-        const callError = mode === "retry"
-            ? error instanceof RetryableRpcCallError
-            : error instanceof SingleRpcCallError;
-        if (callbackStarted && !callError) {
+        const transportError = getRpcOriginError(error);
+        if (transportError === undefined) {
             return { category: "unknown", error, retry: false };
         }
-
-        const transportError = callError && (error instanceof RetryableRpcCallError || error instanceof SingleRpcCallError)
-            ? error.cause
-            : error;
         const decision = this.#applyTransportFailure(endpoint, transportError);
         return mode === "once" && callbackStarted ? { ...decision, retry: false } : decision;
     }
@@ -491,7 +465,7 @@ export class RpcPoolManager {
         previousFailure.endpoint.emit({
             ...previousFailure.endpoint.eventBase("switch"),
             category: previousFailure.category,
-            nextEndpointId: endpoint.endpointId,
+            nextHostname: endpoint.hostname,
             nextEndpointNumber: endpoint.endpointNumber,
         });
     }

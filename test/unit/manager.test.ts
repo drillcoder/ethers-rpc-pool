@@ -1,4 +1,5 @@
 import { Wallet, keccak256 } from "ethers";
+import type { JsonRpcProvider } from "ethers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -11,11 +12,9 @@ import {
 } from "../../src/index.js";
 import { EndpointJsonRpcProvider, RpcTransportResponseError } from "../../src/transport/provider.js";
 import type {
-    RetryableRpcClient,
     RpcExecutionOptions,
     RpcPoolLoggerEvent,
     RpcPoolManagerConfig,
-    SingleAttemptRpcClient,
 } from "../../src/index.js";
 
 const config: RpcPoolManagerConfig = {
@@ -51,7 +50,7 @@ function deferred<Value>(): {
 function executeInMode<Result>(
     manager: RpcPoolManager,
     mode: "retry" | "once",
-    callback: (client: RetryableRpcClient | SingleAttemptRpcClient) => Promise<Result>,
+    callback: (client: JsonRpcProvider) => Promise<Result>,
     options: RpcExecutionOptions,
 ): Promise<Result> {
     return mode === "retry"
@@ -103,7 +102,7 @@ describe("RpcPoolManager operation entry points", () => {
         expect(methods).toEqual(["eth_chainId", "eth_blockNumber"]);
     });
 
-    it("returns an immutable snapshot with counters, endpoint state, and masked identifiers", async () => {
+    it("returns an immutable snapshot with counters, endpoint state, and hostnames", async () => {
         vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
             const payload = JSON.parse(init?.body as string) as { id: number; method: string };
             if (payload.method === "eth_chainId") {
@@ -146,7 +145,7 @@ describe("RpcPoolManager operation entry points", () => {
                     {
                         activeGroups: 0,
                         cooldownUntil: firstEndpoint?.cooldownUntil,
-                        endpointId: "https://first.example/[redacted]/[redacted]",
+                        hostname: "first.example",
                         endpointNumber: 1,
                         errorCount: 1,
                         excludedReason: null,
@@ -157,7 +156,7 @@ describe("RpcPoolManager operation entry points", () => {
                     {
                         activeGroups: 0,
                         cooldownUntil: null,
-                        endpointId: "https://second.example/rpc",
+                        hostname: "second.example",
                         endpointNumber: 2,
                         errorCount: 0,
                         excludedReason: null,
@@ -178,6 +177,31 @@ describe("RpcPoolManager operation entry points", () => {
             (snapshot as { totalRequests: number }).totalRequests = 0;
         }).toThrow(TypeError);
         expect(manager.getSnapshot().totalRequests).toBe(4);
+    });
+
+    it("reports exact standard URL hostnames without changing full-URL deduplication", async () => {
+        const manager = new RpcPoolManager({
+            ...config,
+            networks: [{
+                chainId: 1,
+                rpcUrls: [
+                    "https://user:password@customer123.rpc.example.com:9443/key?token=value#fragment",
+                    "http://localhost:8545/rpc",
+                    "http://127.0.0.1:8545/a",
+                    "http://[::1]:8545/a",
+                    "https://customer123.rpc.example.com/other",
+                ],
+            }],
+        });
+
+        expect(manager.getSnapshot().networks[0]?.endpoints.map(({ hostname }) => hostname)).toEqual([
+            "customer123.rpc.example.com",
+            "localhost",
+            "127.0.0.1",
+            "[::1]",
+            "customer123.rpc.example.com",
+        ]);
+        await manager.close();
     });
 
     it("reports exact request counters and latency EWMA in its snapshot", async () => {
@@ -261,16 +285,15 @@ describe("RpcPoolManager operation entry points", () => {
         await secondStarted.promise;
 
         expect(manager.getSnapshot()).toMatchObject({
-            networks: [{ endpoints: [{ activeGroups: 1 }, { activeGroups: 1 }] }],
-            requestsByMethod: { debug_first: 1, debug_second: 1, eth_chainId: 2 },
+            networks: [{ endpoints: [{ activeGroups: 2 }, { activeGroups: 0 }] }],
+            requestsByMethod: { debug_first: 1, debug_second: 1, eth_chainId: 1 },
             totalActiveGroups: 2,
-            totalRequests: 4,
+            totalRequests: 3,
         });
         expect(requests).toEqual([
             "first.example:eth_chainId",
             "first.example:debug_first",
-            "second.example:eth_chainId",
-            "second.example:debug_second",
+            "first.example:debug_second",
         ]);
 
         releaseCallbacks.resolve(undefined);
@@ -307,7 +330,7 @@ describe("RpcPoolManager operation entry points", () => {
         await Promise.all([firstManager.close(), secondManager.close()]);
     });
 
-    it("logs transport, cooldown, and switch events with safe endpoint identifiers", async () => {
+    it("logs transport, cooldown, and switch events with hostnames", async () => {
         const events: RpcPoolLoggerEvent[] = [];
         vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
             const payload = JSON.parse(init?.body as string) as { id: number; method: string };
@@ -352,7 +375,7 @@ describe("RpcPoolManager operation entry points", () => {
         ]);
         expect(events.find(({ type }) => type === "error")).toMatchObject({
             category: "rate-limit",
-            endpointId: "https://first.example/v3/[redacted]",
+            hostname: "first.example",
             httpStatus: 429,
             method: "eth_blockNumber",
             retryAfterMs: 2_000,
@@ -360,7 +383,7 @@ describe("RpcPoolManager operation entry points", () => {
         expect(events.find(({ type }) => type === "switch")).toMatchObject({
             category: "rate-limit",
             endpointNumber: 1,
-            nextEndpointId: "https://second.example/rpc",
+            nextHostname: "second.example",
             nextEndpointNumber: 2,
         });
         expect(events.find(({ type }) => type === "cooldown")).toMatchObject({
@@ -616,7 +639,7 @@ describe("RpcPoolManager operation entry points", () => {
             ...config,
             networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
         });
-        const callback = vi.fn(async (client: RetryableRpcClient) => await client.getBlockNumber());
+        const callback = vi.fn(async (client: JsonRpcProvider) => await client.getBlockNumber());
         const operation = manager.executeWithRetry(1, callback, { timeoutMs: 40 });
         const rejection = expect(operation).rejects.toEqual(new OperationTimeoutError(1, 40));
 
@@ -656,7 +679,7 @@ describe("RpcPoolManager operation entry points", () => {
             networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
             operationTimeoutMs: 10_000,
         });
-        const callback = vi.fn(async (client: RetryableRpcClient) => await client.getBlockNumber());
+        const callback = vi.fn(async (client: JsonRpcProvider) => await client.getBlockNumber());
         const operation = manager.executeWithRetry(1, callback);
         await vi.advanceTimersByTimeAsync(100);
         expect(cooldowns).toHaveLength(2);
@@ -781,14 +804,14 @@ describe("RpcPoolManager operation entry points", () => {
         await manager.close();
     });
 
-    it.each(["retry", "once"] as const)("deactivates the %s client when its callback times out", async (mode) => {
+    it.each(["retry", "once"] as const)("keeps the shared %s provider usable after callback timeout", async (mode) => {
         vi.useFakeTimers();
         const request = vi.fn((_input: string | URL | Request, init?: RequestInit) =>
             Promise.resolve(rpcResponse(init ?? {})));
         vi.stubGlobal("fetch", request);
         const manager = new RpcPoolManager(config);
-        let selectedClient: RetryableRpcClient | SingleAttemptRpcClient | undefined;
-        const callback = vi.fn(async (client: RetryableRpcClient | SingleAttemptRpcClient) => {
+        let selectedClient: JsonRpcProvider | undefined;
+        const callback = vi.fn(async (client: JsonRpcProvider) => {
             selectedClient = client;
             return await new Promise<never>(() => undefined);
         });
@@ -798,8 +821,8 @@ describe("RpcPoolManager operation entry points", () => {
         await vi.advanceTimersByTimeAsync(25);
 
         await rejection;
-        await expect(selectedClient?.getBlockNumber()).rejects.toThrow("RPC client attempt is no longer active");
-        expect(request).toHaveBeenCalledOnce();
+        await expect(selectedClient?.getBlockNumber()).resolves.toBe(42);
+        expect(request).toHaveBeenCalledTimes(2);
     });
 
     it.each(["retry", "once"] as const)("preserves abort reason during a %s callback", async (mode) => {
@@ -808,8 +831,8 @@ describe("RpcPoolManager operation entry points", () => {
         const manager = new RpcPoolManager(config);
         const controller = new AbortController();
         const reason = new Error("consumer cancelled");
-        let selectedClient: RetryableRpcClient | SingleAttemptRpcClient | undefined;
-        const callback = vi.fn(async (client: RetryableRpcClient | SingleAttemptRpcClient) => {
+        let selectedClient: JsonRpcProvider | undefined;
+        const callback = vi.fn(async (client: JsonRpcProvider) => {
             selectedClient = client;
             return await new Promise<never>(() => undefined);
         });
@@ -821,7 +844,7 @@ describe("RpcPoolManager operation entry points", () => {
         controller.abort(reason);
 
         await expect(operation).rejects.toBe(reason);
-        await expect(selectedClient?.getBlockNumber()).rejects.toThrow("RPC client attempt is no longer active");
+        await expect(selectedClient?.getBlockNumber()).resolves.toBe(42);
     });
 
     it.each(["retry", "once"] as const)("preserves a pre-aborted reason in %s mode", async (mode) => {
@@ -905,7 +928,7 @@ describe("RpcPoolManager operation entry points", () => {
         const manager = new RpcPoolManager(config);
         const controller = new AbortController();
         const reason = new Error("request cancelled");
-        const callback = vi.fn(async (client: RetryableRpcClient | SingleAttemptRpcClient) =>
+        const callback = vi.fn(async (client: JsonRpcProvider) =>
             await client.getBlockNumber());
         const operation = executeInMode(manager, mode, callback, { signal: controller.signal });
 
@@ -982,7 +1005,7 @@ describe("RpcPoolManager operation entry points", () => {
         const manager = new RpcPoolManager(config);
         const controller = new AbortController();
         const reason = new Error("cancelled");
-        const callback = vi.fn(async (client: RetryableRpcClient | SingleAttemptRpcClient) =>
+        const callback = vi.fn(async (client: JsonRpcProvider) =>
             await client.getBlockNumber());
         try {
             const operation = executeInMode(manager, mode, callback, { signal: controller.signal });
@@ -1042,7 +1065,7 @@ describe("RpcPoolManager operation entry points", () => {
             });
             vi.stubGlobal("fetch", request);
             const manager = new RpcPoolManager(config);
-            const callback = vi.fn(async (client: RetryableRpcClient | SingleAttemptRpcClient) =>
+            const callback = vi.fn(async (client: JsonRpcProvider) =>
                 await client.getBlockNumber());
             const failure = await (mode === "retry"
                 ? manager.executeWithRetry(1, callback)
@@ -1078,7 +1101,7 @@ describe("RpcPoolManager operation entry points", () => {
             ...config,
             networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
         });
-        const callback = vi.fn(async (client: RetryableRpcClient) => await client.getBlockNumber());
+        const callback = vi.fn(async (client: JsonRpcProvider) => await client.getBlockNumber());
 
         await expect(manager.executeWithRetry(1, callback)).resolves.toBe(42);
         expect(callback).toHaveBeenCalledTimes(2);
@@ -1122,26 +1145,26 @@ describe("RpcPoolManager operation entry points", () => {
         await manager.close();
     });
 
-    it("deactivates a retryable client when its callback finishes", async () => {
+    it("keeps a retryable provider usable outside the finished callback", async () => {
         const request = vi.fn((_input: string | URL | Request, init?: RequestInit) =>
             Promise.resolve(rpcResponse(init ?? {})));
         vi.stubGlobal("fetch", request);
         const manager = new RpcPoolManager(config);
         const client = await manager.executeWithRetry(1, (selected) => Promise.resolve(selected));
 
-        await expect(client.getBlockNumber()).rejects.toThrow("RPC client attempt is no longer active");
-        expect(request).toHaveBeenCalledOnce();
+        await expect(client.getBlockNumber()).resolves.toBe(42);
+        expect(request).toHaveBeenCalledTimes(2);
     });
 
-    it("deactivates a single-attempt client when its callback finishes", async () => {
+    it("keeps a single-attempt provider usable outside the finished callback", async () => {
         const request = vi.fn((_input: string | URL | Request, init?: RequestInit) =>
             Promise.resolve(rpcResponse(init ?? {})));
         vi.stubGlobal("fetch", request);
         const manager = new RpcPoolManager(config);
         const client = await manager.executeOnce(1, (selected) => Promise.resolve(selected));
 
-        await expect(client.getBlockNumber()).rejects.toThrow("RPC client attempt is no longer active");
-        expect(request).toHaveBeenCalledOnce();
+        await expect(client.getBlockNumber()).resolves.toBe(42);
+        expect(request).toHaveBeenCalledTimes(2);
     });
 
     it("restarts the whole callback on another endpoint after a retryable client failure", async () => {
@@ -1164,9 +1187,9 @@ describe("RpcPoolManager operation entry points", () => {
             ...config,
             networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
         });
-        const clients: RetryableRpcClient[] = [];
+        const clients: JsonRpcProvider[] = [];
         const firstResults: bigint[] = [];
-        const callback = vi.fn(async (client: RetryableRpcClient): Promise<bigint[]> => {
+        const callback = vi.fn(async (client: JsonRpcProvider): Promise<bigint[]> => {
             clients.push(client);
             const first = await client.getBalance("0x0000000000000000000000000000000000000001");
             firstResults.push(first);
@@ -1177,9 +1200,7 @@ describe("RpcPoolManager operation entry points", () => {
         await expect(manager.executeWithRetry(1, callback)).resolves.toEqual([20n, 21n]);
         expect(callback).toHaveBeenCalledTimes(2);
         expect(firstResults).toEqual([10n, 20n]);
-        for (const client of clients) {
-            await expect(client.getBlockNumber()).rejects.toThrow("RPC client attempt is no longer active");
-        }
+        expect(clients.every((client) => client instanceof EndpointJsonRpcProvider)).toBe(true);
         expect(calls.get("https://first.example/")).toEqual(["eth_chainId", "eth_getBalance", "eth_getBalance"]);
         expect(calls.get("https://second.example/")).toEqual(["eth_chainId", "eth_getBalance", "eth_getBalance"]);
     });
@@ -1243,7 +1264,7 @@ describe("RpcPoolManager operation entry points", () => {
             ...config,
             networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
         });
-        const callback = vi.fn<(client: SingleAttemptRpcClient) => Promise<unknown>>(
+        const callback = vi.fn<(client: JsonRpcProvider) => Promise<unknown>>(
             async (client) => {
                 await client.send("eth_sendRawTransaction", ["0x01"]);
             },
@@ -1291,9 +1312,9 @@ describe("RpcPoolManager operation entry points", () => {
             value: 0n,
         } as const;
         const signedTransaction = await wallet.signTransaction({ ...transaction, nonce: 0 });
-        const broadcastCallback = vi.fn(async (client: SingleAttemptRpcClient) =>
+        const broadcastCallback = vi.fn(async (client: JsonRpcProvider) =>
             await client.broadcastTransaction(signedTransaction));
-        const signerCallback = vi.fn(async (client: SingleAttemptRpcClient) =>
+        const signerCallback = vi.fn(async (client: JsonRpcProvider) =>
             await wallet.connect(client).getNonce("latest"));
 
         await expect(manager.executeOnce(1, broadcastCallback)).resolves.toMatchObject({ nonce: 0 });
@@ -1304,29 +1325,24 @@ describe("RpcPoolManager operation entry points", () => {
         await manager.close();
     });
 
-    it("keeps events and destroy local to an executeOnce facade", async () => {
+    it("leaves shared-provider listeners under consumer control", async () => {
         vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) =>
             Promise.resolve(rpcResponse(init ?? {}))));
         const on = vi.spyOn(EndpointJsonRpcProvider.prototype, "on").mockResolvedValue({} as EndpointJsonRpcProvider);
         const off = vi.spyOn(EndpointJsonRpcProvider.prototype, "off").mockResolvedValue({} as EndpointJsonRpcProvider);
-        const destroy = vi.spyOn(EndpointJsonRpcProvider.prototype, "destroy");
         const manager = new RpcPoolManager(config);
         const listener = vi.fn();
 
         await manager.executeOnce(1, async (client) => {
             await client.on("block", listener);
-            client.destroy();
-            await expect(client.send("debug_after_destroy", [])).rejects.toThrow(
-                "RPC client attempt is no longer active",
-            );
+            await expect(client.send("debug_after_listener", [])).resolves.toBe("0x2a");
+            await client.off("block", listener);
         });
 
         expect(on).toHaveBeenCalledWith("block", listener);
         expect(off).toHaveBeenCalledWith("block", listener);
-        expect(destroy).not.toHaveBeenCalled();
         await expect(manager.executeOnce(1, () => Promise.resolve("still active"))).resolves.toBe("still active");
         await manager.close();
-        expect(destroy).toHaveBeenCalledOnce();
     });
 
     it("cools endpoint data failures without retrying a started single callback", async () => {
@@ -1367,7 +1383,7 @@ describe("RpcPoolManager operation entry points", () => {
         const manager = new RpcPoolManager({ ...config, operationTimeoutMs: 10_000 });
         const firstCallFinished = deferred<undefined>();
         const resumeFirstCallback = deferred<undefined>();
-        const callback = vi.fn(async (client: RetryableRpcClient) => {
+        const callback = vi.fn(async (client: JsonRpcProvider) => {
             await client.getBlockNumber();
             if (callback.mock.calls.length === 1) {
                 firstCallFinished.resolve(undefined);
@@ -1408,7 +1424,7 @@ describe("RpcPoolManager operation entry points", () => {
         const pause = new Promise<void>((resolve) => {
             resumeFirst = resolve;
         });
-        const callback = vi.fn<(client: SingleAttemptRpcClient) => Promise<void>>(async (client) => {
+        const callback = vi.fn<(client: JsonRpcProvider) => Promise<void>>(async (client) => {
             await client.send("debug_first", []);
             reportFirstCall?.();
             await pause;

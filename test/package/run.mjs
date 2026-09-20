@@ -101,12 +101,10 @@ await writeJson(path.join(projectRoot, "tsconfig.json"), {
 await writeFile(path.join(projectRoot, "index.ts"), `
 import { RpcPoolManager } from "${packageName}";
 import type {
-    RetryableRpcClient,
     RpcExecutionOptions,
     RpcPoolLoggerEvent,
     RpcPoolManagerConfig,
     RpcPoolSnapshot,
-    SingleAttemptRpcClient,
 } from "${packageName}";
 
 const config: RpcPoolManagerConfig = {
@@ -116,11 +114,9 @@ const config: RpcPoolManagerConfig = {
 };
 const manager = new RpcPoolManager(config);
 const values: [
-    RetryableRpcClient?,
     RpcExecutionOptions?,
     RpcPoolLoggerEvent?,
     RpcPoolSnapshot?,
-    SingleAttemptRpcClient?,
 ] = [];
 void values;
 await manager.close();

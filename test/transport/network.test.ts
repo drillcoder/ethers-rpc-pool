@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { JsonRpcProvider } from "ethers";
 
 import { RpcPoolManager } from "../../src/index.js";
-import type { RetryableRpcClient, SingleAttemptRpcClient } from "../../src/index.js";
 import { EndpointJsonRpcProvider, RpcRequestTimeoutError } from "../../src/transport/provider.js";
 import { createRpcTestServer, enqueueRpcResult } from "./rpc-server.js";
 import type { RpcTestServer } from "./rpc-server.js";
@@ -23,7 +23,7 @@ describe("RPC network transport", () => {
         enqueueRpcResult(second, "0x1");
         enqueueRpcResult(second, "0x2a");
         const manager = createManager([first.url, second.url]);
-        const callback = vi.fn(async (client: RetryableRpcClient) => await client.getBlockNumber());
+        const callback = vi.fn(async (client: JsonRpcProvider) => await client.getBlockNumber());
 
         await expect(manager.executeWithRetry(1, callback)).resolves.toBe(42);
 
@@ -86,7 +86,7 @@ describe("RPC network transport", () => {
             response.disconnect();
         });
         const manager = createManager([server.url]);
-        const callback = vi.fn(async (client: SingleAttemptRpcClient): Promise<unknown> => {
+        const callback = vi.fn(async (client: JsonRpcProvider): Promise<unknown> => {
             return await client.send("eth_sendRawTransaction", ["0x01"]) as unknown;
         });
 

@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
     EndpointJsonRpcProvider,
+    getRpcOriginError,
     RpcRequestTimeoutError,
     RpcTransportResponseError,
 } from "../../src/transport/provider.js";
@@ -38,7 +39,7 @@ describe("EndpointJsonRpcProvider", () => {
             async () => await provider.getBlockNumber(),
             controller.signal,
         )).rejects.toBe(reason);
-        expect(request).toHaveBeenCalledOnce();
+        expect(request).not.toHaveBeenCalled();
         provider.destroy();
     });
 
@@ -133,6 +134,26 @@ describe("EndpointJsonRpcProvider", () => {
         provider.destroy();
     });
 
+    it("preserves provenance through an explicit cause chain only", async () => {
+        const failure = new TypeError("connection reset");
+        const provider = new EndpointJsonRpcProvider(rpcUrl, 1, providerOptions(() => Promise.reject(failure)));
+        const origin = await provider.send("eth_blockNumber", []).catch((reason: unknown) => reason);
+        expect(getRpcOriginError(new Error("wrapper", { cause: origin }))).toBe(failure);
+        expect(getRpcOriginError(new Error("local"))).toBeUndefined();
+        const cyclic: { cause?: unknown } = {};
+        cyclic.cause = cyclic;
+        expect(getRpcOriginError(cyclic)).toBeUndefined();
+        provider.destroy();
+    });
+
+    it("passes through a primitive transport rejection without inventing provenance", async () => {
+        // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- Exercise an arbitrary fetch rejection.
+        const provider = new EndpointJsonRpcProvider(rpcUrl, 1, providerOptions(() => Promise.reject("offline")));
+        await expect(provider.send("eth_blockNumber", [])).rejects.toBe("offline");
+        expect(getRpcOriginError("offline")).toBeUndefined();
+        provider.destroy();
+    });
+
     it("preserves HTTP status and headers before ethers handles the response", async () => {
         const request = vi.fn<HttpRequest>(() =>
             Promise.resolve(
@@ -186,6 +207,19 @@ describe("EndpointJsonRpcProvider", () => {
         provider.destroy();
     });
 
+    it("preserves a JSON-RPC error body on a non-success HTTP response", async () => {
+        const rpcError = { code: -32_005, message: "rate limited" };
+        const provider = new EndpointJsonRpcProvider(rpcUrl, 1, providerOptions(() => Promise.resolve(
+            Response.json({ error: rpcError, id: 1, jsonrpc: "2.0" }, { status: 429 }),
+        )));
+
+        await expect(provider.send("eth_blockNumber", [])).rejects.toMatchObject({
+            jsonRpcError: rpcError,
+            status: 429,
+        });
+        provider.destroy();
+    });
+
     it("preserves JSON-RPC error fields from a successful HTTP response", async () => {
         const rpcError = {
             code: -32_000,
@@ -207,28 +241,11 @@ describe("EndpointJsonRpcProvider", () => {
             providerOptions(request),
         );
 
-        await expect(
-            provider._send({
-                id: 1,
-                jsonrpc: "2.0",
-                method: "eth_blockNumber",
-                params: [],
-            }),
-        ).rejects.toMatchObject({
-            jsonRpcError: rpcError,
-            status: 200,
-        });
-
-        const error = await provider
-            ._send({
-                id: 2,
-                jsonrpc: "2.0",
-                method: "eth_blockNumber",
-                params: [],
-            })
-            .catch((reason: unknown) => reason);
+        const error = await provider.send("eth_blockNumber", []).catch((reason: unknown) => reason);
+        const origin = getRpcOriginError(error) as RpcTransportResponseError;
+        expect(origin).toMatchObject({ jsonRpcError: rpcError, status: 200 });
         expect(
-            Object.isFrozen((error as RpcTransportResponseError).jsonRpcError),
+            Object.isFrozen(origin.jsonRpcError),
         ).toBe(true);
 
         provider.destroy();
@@ -392,6 +409,38 @@ describe("EndpointJsonRpcProvider", () => {
         );
         expect(clearTimeout).toHaveBeenCalledWith(timerHandle);
 
+        provider.destroy();
+    });
+
+    it("rejects transport when the reservation becomes stale", async () => {
+        const request = vi.fn<HttpRequest>();
+        const provider = new EndpointJsonRpcProvider(rpcUrl, 1, providerOptions(request));
+
+        await expect(provider.runWithDeadline(
+            Number.POSITIVE_INFINITY,
+            async () => await provider.send("eth_blockNumber", []),
+            undefined,
+            () => false,
+        )).rejects.toThrow("Reserved RPC endpoint is no longer available");
+        expect(request).not.toHaveBeenCalled();
+        provider.destroy();
+    });
+
+    it("aborts an unawaited request when its attempt context closes", async () => {
+        let pending: Promise<unknown> | undefined;
+        const request = vi.fn<HttpRequest>((_input, init) => new Promise((_resolve, reject) => {
+            init.signal?.addEventListener("abort", () => {
+                reject(init.signal?.reason as Error);
+            }, { once: true });
+        }));
+        const provider = new EndpointJsonRpcProvider(rpcUrl, 1, providerOptions(request));
+
+        await provider.runWithDeadline(Number.POSITIVE_INFINITY, () => {
+            pending = provider.send("eth_blockNumber", []);
+            return Promise.resolve();
+        });
+        await expect(pending).rejects.toThrow("context is no longer active");
+        expect(request).toHaveBeenCalledOnce();
         provider.destroy();
     });
 });

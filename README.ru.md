@@ -2,8 +2,9 @@
 
 [🇬🇧 English](README.md) | 🇷🇺 Русский
 
-Отказоустойчивый пул адресов JSON-RPC на TypeScript для ethers v6 и Node.js. Он балансирует параллельные операции,
-охлаждает неисправные endpoint, исключает неверные учётные данные или chain ID и предоставляет безопасную диагностику.
+Отказоустойчивый пул JSON-RPC endpoint для ethers v6 и Node.js. Он выбирает endpoint для каждой операции, учитывает
+latency и нагрузку, повторяет подходящие операции, применяет cooldown после временных сбоев и навсегда исключает
+endpoint с неверной авторизацией или chain ID.
 
 ## Установка
 
@@ -11,11 +12,9 @@
 npm install @drillcoder/ethers-rpc-pool ethers
 ```
 
-Требуются Node.js 22 или новее и ethers v6. Пакет поставляется только как ESM.
+Требования: Node.js 22 или новее, ethers v6 и ESM.
 
-## Создание и закрытие пула
-
-`RpcPoolManager` владеет своими provider и таймерами. Всегда закрывайте его, желательно в `finally`:
+## Создание пула
 
 ```ts runnable
 import { RpcPoolManager } from "@drillcoder/ethers-rpc-pool";
@@ -37,56 +36,59 @@ try {
 }
 ```
 
-Если передать `timeoutMs`, он станет общим лимитом времени для этой операции вместо `operationTimeoutMs` из настроек
-менеджера. В этот лимит входят проверка endpoint, выполнение callback, повторные попытки и ожидание cooldown.
+`requestTimeoutMs` ограничивает один HTTP-запрос. `operationTimeoutMs` ограничивает всю операцию, включая проверку
+chain ID, выполнение callback, retry, ожидание cooldown и переключение endpoint. Для отдельной операции можно задать
+другой общий лимит через `{ timeoutMs }`.
 
-## Повторяемое чтение
+`RpcPoolManager` владеет provider своих endpoint. Когда менеджер больше не нужен, его следует закрыть.
 
-Используйте `executeWithRetry()` для группы запросов только на чтение. На всю попытку закрепляется один endpoint. После
-повторяемого сбоя пул может заново запустить callback на другом endpoint в пределах общего deadline операции.
+## Операции с retry
+
+`executeWithRetry()` предназначен для callback, который можно безопасно запустить заново с начала. В пределах одной
+попытки используется один закреплённый endpoint. После повторяемого сбоя endpoint новая попытка запускается на
+пригодном endpoint в пределах исходного deadline операции.
 
 ```ts
 const account = "0x0000000000000000000000000000000000000000";
 
 const state = await pool.executeWithRetry(
     1,
-    async (client) => {
+    async (provider) => {
         const [blockNumber, balance, transactionCount] = await Promise.all([
-            client.getBlockNumber(),
-            client.getBalance(account),
-            client.getTransactionCount(account),
+            provider.getBlockNumber(),
+            provider.getBalance(account),
+            provider.getTransactionCount(account),
         ]);
+
         return { balance, blockNumber, transactionCount };
     },
     { timeoutMs: 15_000 },
 );
 ```
 
-`RetryableRpcClient` предоставляет полный стандартный API чтения, симуляции, разрешения имён и ожидания,
-поддерживаемый пулом:
+Callback получает ethers `JsonRpcProvider` с полным API, включая contract, signer, события и raw JSON-RPC:
 
-- `getNetwork()`, `getBlockNumber()`, `getBlock()`
-- `getBalance()`, `getTransactionCount()`, `getCode()`, `getStorage()`
-- `getFeeData()`, `getLogs()`
-- `getTransaction()`, `getTransactionReceipt()`, `getTransactionResult()`
-- `call()`, `estimateGas()`
-- `resolveName()`, `lookupAddress()`
-- `waitForBlock()`, `waitForTransaction()`
+```ts
+const blockHex = await pool.executeWithRetry(
+    1,
+    async (provider) => await provider.send("eth_blockNumber", []),
+);
+```
 
-В нём намеренно нет отправки транзакций, произвольного JSON-RPC, подписок и методов жизненного цикла.
+Единицей retry является весь callback. Побочные эффекты приложения внутри него должны допускать повторение.
 
-## Однократная запись
+## Однократные операции
 
-Используйте `executeOnce()` для операций, изменяющих состояние. Его клиент совместим с ethers v6 `JsonRpcProvider`,
-включая `broadcastTransaction()`, raw `send()`, события и подключённые signer.
+`executeOnce()` запускает callback один раз. Используйте его для отправки транзакций и других операций, результат
+которых небезопасно воспроизводить автоматически.
 
 ```ts
 import { Wallet } from "ethers";
 
 const wallet = new Wallet(process.env.PRIVATE_KEY!);
 
-const transaction = await pool.executeOnce(1, async (client) => {
-    const signer = wallet.connect(client);
+const transaction = await pool.executeOnce(1, async (provider) => {
+    const signer = wallet.connect(provider);
     return await signer.sendTransaction({
         to: "0x000000000000000000000000000000000000dEaD",
         value: 1n,
@@ -96,54 +98,69 @@ const transaction = await pool.executeOnce(1, async (client) => {
 console.log(transaction.hash);
 ```
 
-В этом же режиме подписанную транзакцию можно отправить через `client.broadcastTransaction(signedTransaction)`.
+Если запись дошла до RPC-сервера, а ответ потерялся, операция завершится ошибкой при неизвестном результате в сети.
+Перед повторной отправкой проверьте состояние сети или приложения.
 
-## Ошибки
+## Время жизни provider и listeners
 
-Публичные ошибки являются обычными классами, поэтому для сужения типа используйте `instanceof`:
+Каждый endpoint имеет один общий `JsonRpcProvider`, которым владеет менеджер. Завершение callback сохраняет provider
+и его listeners активными. Код, добавивший listener, должен сам его удалить:
 
 ```ts
-import {
-    NoUsableRpcEndpointError,
-    OperationTimeoutError,
-    RpcEndpointDataError,
-    RpcPoolClosedError,
-    UnknownNetworkError,
-} from "@drillcoder/ethers-rpc-pool";
+await pool.executeOnce(1, async (provider) => {
+    const listener = (blockNumber: number): void => {
+        console.log(blockNumber);
+    };
 
-try {
-    await pool.executeWithRetry(1, async (client) => {
-        const block = await client.getBlock("latest");
-        if (block === null) throw new RpcEndpointDataError("Latest block is missing");
-        return block;
-    });
-} catch (error) {
-    if (error instanceof UnknownNetworkError) {
-        console.error("Сеть не настроена", error.chainId);
-    } else if (error instanceof NoUsableRpcEndpointError) {
-        console.error("Все endpoint исключены навсегда", error.chainId);
-    } else if (error instanceof OperationTimeoutError) {
-        console.error("Время операции истекло", error.timeoutMs);
-    } else if (error instanceof RpcPoolClosedError) {
-        console.error("Пул закрыт");
-    } else {
-        throw error;
+    await provider.on("block", listener);
+    try {
+        return await provider.getBlockNumber();
+    } finally {
+        await provider.off("block", listener);
     }
-}
+});
 ```
 
-Выбрасывайте `RpcEndpointDataError`, если endpoint вернул структурно корректные, но непригодные данные. Пул временно
-пометит такой endpoint как неисправный.
+Вызов `destroy()` или изменение общих настроек provider влияет на всех пользователей provider этого endpoint.
+Сохранённый provider при позднем вызове вне execution callback отправляет запрос прямо на закреплённый endpoint. Такой
+вызов использует transport timeout и observability, но не участвует в выборе пула, retry, active groups и deadline
+предыдущей операции.
 
-## Отмена
+Контекст выполнения закрывается вместе с попыткой. Асинхронная работа, унаследовавшая закрытый контекст, не может
+начать новый управляемый HTTP-запрос. Эта граница относится к сетевым запросам; уже запущенный JavaScript-код
+продолжает выполняться по обычным правилам JavaScript.
 
-Оба режима выполнения принимают `AbortSignal`. Если у сигнала задана причина, возвращённый promise отклоняется с ней.
+## Выбор endpoint
+
+Первичные операции `executeWithRetry()` сначала получают реальный замер latency каждого свободного пригодного
+endpoint. Отдельный warmup-запрос для этого не создаётся.
+
+После начальных измерений обычный выбор минимизирует:
+
+```text
+latencyEwmaMs × (activeGroups + 1)
+```
+
+Точное равенство разрешается round-robin. Cooling, excluded и занятые probe endpoint исключаются до ранжирования.
+
+Каждое двадцатое первичное резервирование `executeWithRetry()` является исследующим. При наличии свободной пригодной
+альтернативы выбирается endpoint, который дольше всего не резервировался. Иначе применяется обычный победитель, а
+исследующая позиция считается использованной. Retry, ожидание cooldown, начальные измерения и `executeOnce()` не
+сдвигают этот счётчик.
+
+Для исследования используется реальная операция вызывающей стороны. Дополнительные callback, HTTP-запросы и фоновые
+таймеры не создаются. Алгоритм выбора является эвристикой и не гарантирует конкретную latency, свежесть блока или
+время включения транзакции.
+
+## Отмена и ошибки
+
+Оба метода выполнения принимают `AbortSignal`:
 
 ```ts
 const controller = new AbortController();
 const operation = pool.executeWithRetry(
     1,
-    async (client) => await client.waitForBlock(20_000),
+    async (provider) => await provider.waitForBlock(20_000),
     { signal: controller.signal },
 );
 
@@ -151,39 +168,40 @@ controller.abort(new Error("Операция отменена вызывающе
 await operation;
 ```
 
-## Важные особенности выполнения
+Пакет экспортирует следующие классы ошибок:
 
-- `executeWithRetry()` повторяет весь callback, а не только неудачный RPC-запрос. Поэтому внешние побочные эффекты
-  callback могут выполниться несколько раз. Весь callback должен быть идемпотентным.
-- После запуска callback метод `executeOnce()` никогда не запускает его повторно. Это предотвращает автоматическую
-  повторную запись, но не гарантирует её однократное выполнение.
-- Если запись дошла до RPC-сервера, но ответ потерялся, `executeOnce()` вернёт ошибку, хотя запись могла выполниться.
-  Результат такой операции неизвестен: перед ручным повтором проверьте состояние сети или приложения.
-- Endpoint, вернувший HTTP- или JSON-RPC-ошибку авторизации, остаётся исключённым до конца жизни менеджера. Исправьте
-  учётные данные и создайте новый `RpcPoolManager`, чтобы снова использовать этот endpoint.
-- Отмена прекращает ожидания и запросы под управлением пула и быстро завершает публичный promise. Она не может
-  принудительно остановить синхронный код или другую работу callback, которая не поддерживает отмену. Такой код может
-  продолжить работу, но выданный ему клиент уже деактивирован, а итоговое завершение callback будет проигнорировано.
-  Блокировка event loop также задерживает обработку отмены.
+- `UnknownNetworkError` — запрошенный chain ID не настроен.
+- `NoUsableRpcEndpointError` — все endpoint сети навсегда исключены.
+- `OperationTimeoutError` — истёк общий deadline операции.
+- `RpcPoolClosedError` — операция запущена после закрытия менеджера.
+- `RpcEndpointDataError` — код приложения отверг структурно корректные, но непригодные данные endpoint.
 
-## Snapshot, logger и метрики
+HTTP- или JSON-RPC-ошибка авторизации навсегда исключает endpoint до закрытия менеджера. Временные transport-сбои
+обрабатываются правилами cooldown и recovery. Локальные ошибки callback передаются вызывающей стороне и не меняют
+состояние endpoint.
 
-`getSnapshot()` возвращает неизменяемый срез счётчиков запросов, категорий ошибок, активных групп, latency EWMA,
-cooldown и состояния endpoint. Идентификаторы endpoint очищены от секретов.
+## Snapshot и logger
+
+`getSnapshot()` возвращает неизменяемый срез счётчиков, active groups, состояния endpoint, сроков cooldown и latency
+EWMA.
 
 ```ts
 const snapshot = pool.getSnapshot();
-console.log(snapshot.totalRequests, snapshot.errorsByCategory);
 
 for (const network of snapshot.networks) {
     for (const endpoint of network.endpoints) {
-        console.log(network.chainId, endpoint.endpointId, endpoint.status, endpoint.latencyEwmaMs);
+        console.log({
+            chainId: network.chainId,
+            endpointNumber: endpoint.endpointNumber,
+            hostname: endpoint.hostname,
+            status: endpoint.status,
+            latencyEwmaMs: endpoint.latencyEwmaMs,
+        });
     }
 }
 ```
 
-Logger получает события `request`, `response`, `error`, `switch`, `cooldown` и `recovery`. Небольшой адаптер может
-преобразовать их в метрики без привязки пула к библиотеке мониторинга:
+Необязательный logger получает события `request`, `response`, `error`, `switch`, `cooldown` и `recovery`:
 
 ```ts
 import { RpcPoolManager, type RpcPoolLoggerEvent } from "@drillcoder/ethers-rpc-pool";
@@ -200,36 +218,26 @@ const monitoredPool = new RpcPoolManager({
     operationTimeoutMs: 30_000,
     logger: recordMetric,
 });
-
-try {
-    await monitoredPool.executeWithRetry(1, async (client) => await client.getBlockNumber());
-} finally {
-    await monitoredPool.close();
-}
 ```
 
-Ошибки logger изолированы от RPC-операций. Идентификаторы endpoint и поля ошибок очищаются до передачи события.
+Endpoint определяется тройкой `(chainId, endpointNumber, hostname)`. `hostname` точно равен
+`new URL(rpcUrl).hostname`: в него не входят userinfo, порт, path, query и fragment. Поддомены сохраняются и могут
+содержать идентификатор аккаунта или внутреннее имя. Logger пула не включает полный URL, тела запросов и ответов или
+текст внешней ошибки. Ошибка logger не влияет на выполнение RPC.
 
-## Команды разработки
+## Разработка
 
-- `npm run build` — собрать ESM JavaScript, declarations, declaration maps и source maps.
-- `npm run typecheck` — проверить типы production-кода и compile-time API-тестов без генерации файлов.
+- `npm run build` — собрать ESM JavaScript и TypeScript declarations.
+- `npm run typecheck` — проверить типы исходного кода и compile-time API-тестов.
 - `npm run lint` — запустить ESLint с запретом предупреждений.
-- `npm run lint:fix` — применить безопасные исправления ESLint.
-- `npm test` — запустить герметичные тесты Vitest.
-- `npm run test:coverage` — запустить тесты и проверить 100% покрытия строк, функций, ветвей и выражений.
-- `npm run pack:test` — собрать, упаковать, установить и проверить артефакт в чистом ESM-проекте.
-- `npm run quality` — запустить полную каноническую проверку качества.
+- `npm test` — запустить набор тестов Vitest.
+- `npm run test:coverage` — запустить тесты с порогом покрытия 100%.
+- `npm run pack:test` — проверить установленный npm tarball и исполняемый пример README.
+- `npm run quality` — выполнить полную проверку качества.
 
-## Полная проверка качества в Docker
-
-Для полной проверки на хосте требуется только Docker. Используются зафиксированные версии Node.js и npm, внешний
-RPC-сервис не нужен:
+Каноническая проверка запускается в Docker и не требует установки Node.js или внешнего RPC-сервиса на хосте:
 
 ```sh
 docker build --tag ethers-rpc-pool-quality .
-docker run --rm ethers-rpc-pool-quality
+docker run --rm --network none ethers-rpc-pool-quality
 ```
-
-Контейнер запускает `npm run quality`: сборку, проверку типов, линтинг, герметичные тесты, 100% покрытия и smoke-тест
-упакованного npm-пакета.

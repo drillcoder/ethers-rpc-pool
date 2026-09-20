@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { JsonRpcProvider } from "ethers";
 
 import { RpcPoolManager } from "../../src/index.js";
-import type { RetryableRpcClient } from "../../src/index.js";
 import { createRpcTestServer, enqueueRpcResult, rpcRequestId } from "./rpc-server.js";
 import type { RpcTestServer } from "./rpc-server.js";
 
@@ -80,7 +80,7 @@ describe("RPC transport failure matrix", () => {
             operationTimeoutMs: 2_000,
             requestTimeoutMs: 1_000,
         });
-        const callback = vi.fn(async (client: RetryableRpcClient) => await client.getBlockNumber());
+        const callback = vi.fn(async (client: JsonRpcProvider) => await client.getBlockNumber());
 
         await expect(manager.executeWithRetry(1, callback)).resolves.toBe(42);
 

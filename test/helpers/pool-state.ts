@@ -11,6 +11,7 @@ function createEndpointState(rpcUrl: string, endpointNumber: number): EndpointSt
         excludedReason: null,
         failureStreaks: { long: 0, short: 0 },
         latencyEwmaMs: null,
+        lastReserved: 0,
         probeToken: null,
         rpcUrl,
         status: "available",
@@ -25,6 +26,8 @@ export function createPoolState(networks: readonly RpcNetworkConfig[]): PoolStat
             activeGroups: 0,
             chainId: network.chainId,
             endpoints: network.rpcUrls.map((rpcUrl, index) => createEndpointState(rpcUrl, index + 1)),
+            primaryRetrySelections: 0,
+            reservationClock: 0,
             selectionCursor: 0,
         }])),
     };
