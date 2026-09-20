@@ -29,6 +29,15 @@ const cases: readonly FailureCase[] = [
     },
     { category: "http-5xx", excluded: false, name: "HTTP 503", status: 503 },
     {
+        category: "http-5xx",
+        error: { code: -32_603, message: "Internal error" },
+        excluded: false,
+        headers: { "retry-after": "45" },
+        minimumCooldownMs: 45_000,
+        name: "HTTP 503 with an unknown JSON-RPC error",
+        status: 503,
+    },
+    {
         category: "authorization",
         error: { code: -32_000, message: "invalid API key" },
         excluded: true,
@@ -136,6 +145,48 @@ describe("RPC transport failure matrix", () => {
         const failedEndpoint = manager.getSnapshot().networks[0]?.endpoints[0];
         expect(failedEndpoint?.cooldownUntil).toBeGreaterThanOrEqual(retryAt - 1_000);
         expect(manager.getSnapshot().errorsByCategory).toEqual({ "rate-limit": 1 });
+        await manager.close();
+    });
+
+    it.each(["retry", "once"] as const)("handles an invalid successful response in %s mode", async (mode) => {
+        const first = await createRpcTestServer();
+        const second = await createRpcTestServer();
+        servers.push(first, second);
+        enqueueRpcResult(first, "0x1");
+        first.enqueue((_request, response) => {
+            response.json({});
+        });
+        enqueueRpcResult(second, "0x1");
+        enqueueRpcResult(second, "0x2a");
+        const events: unknown[] = [];
+        const manager = new RpcPoolManager({
+            logger: (event) => {
+                events.push(event);
+            },
+            networks: [{ chainId: 1, rpcUrls: [first.url, second.url] }],
+            operationTimeoutMs: 2_000,
+            requestTimeoutMs: 1_000,
+        });
+        const callback = vi.fn(async (client: JsonRpcProvider) => await client.getBlockNumber());
+
+        const operation = mode === "retry"
+            ? manager.executeWithRetry(1, callback)
+            : manager.executeOnce(1, callback);
+        if (mode === "retry") {
+            await expect(operation).resolves.toBe(42);
+            expect(callback).toHaveBeenCalledTimes(2);
+            expect(second.requests).toHaveLength(2);
+        } else {
+            await expect(operation).rejects.toMatchObject({ invalidResponse: true, status: 200 });
+            expect(callback).toHaveBeenCalledOnce();
+            expect(second.requests).toHaveLength(0);
+        }
+        expect(first.requests).toHaveLength(2);
+        expect(manager.getSnapshot()).toMatchObject({
+            errorsByCategory: { "endpoint-data": 1 },
+            totalRequests: mode === "retry" ? 4 : 2,
+        });
+        expect(events.filter((event) => (event as { type?: string }).type === "error")).toHaveLength(1);
         await manager.close();
     });
 });

@@ -61,6 +61,12 @@ describe("applyShortCooldown", () => {
         expect(applyShortCooldown(endpoint, 1_000, { random: () => 0 })).toBe(20_000);
         expect(endpoint.version).toBe(1);
     });
+
+    it("uses Retry-After as the minimum short cooldown", () => {
+        const endpoint = createEndpoint();
+
+        expect(applyShortCooldown(endpoint, 1_000, { random: () => 0.5 }, 90_000)).toBeCloseTo(100_000);
+    });
 });
 
 describe("applyLongCooldown", () => {

@@ -52,6 +52,9 @@ jobs:
       - name: Install locked dependencies
         run: npm ci
 
+      - name: Build package
+        run: npm run build
+
       - name: Publish release
         run: npm exec semantic-release
         env:

@@ -27,6 +27,74 @@ function providerOptions(request: HttpRequest) {
 }
 
 describe("EndpointJsonRpcProvider", () => {
+    it.each([
+        ["empty object", {}],
+        ["array", []],
+        ["null", null],
+        ["primitive", 7],
+        ["foreign id", { id: 2, jsonrpc: "2.0", result: "ok" }],
+        ["string id", { id: "1", jsonrpc: "2.0", result: "ok" }],
+        ["wrong version", { id: 1, jsonrpc: "1.0", result: "ok" }],
+        ["both result and error", { error: { code: -1, message: "bad" }, id: 1, jsonrpc: "2.0", result: null }],
+        ["null error", { error: null, id: 1, jsonrpc: "2.0" }],
+        ["invalid error", { error: { code: "-1", message: 3 }, id: 1, jsonrpc: "2.0" }],
+    ])("rejects an invalid JSON-RPC envelope: %s", async (_name, body) => {
+        const provider = new EndpointJsonRpcProvider(rpcUrl, 1, providerOptions(() => Promise.resolve(
+            Response.json(body),
+        )));
+
+        const error = await provider._send({
+            id: 1,
+            jsonrpc: "2.0",
+            method: "test",
+            params: [],
+        }).catch((reason: unknown) => reason);
+
+        expect(error).toMatchObject({ invalidResponse: true, status: 200 });
+        expect(getRpcFailure(error)).toMatchObject({ action: "cooldown", category: "endpoint-data" });
+        provider.destroy();
+    });
+
+    it.each([null, false, 0, "", [], { value: true }])("accepts a JSON-RPC result value %#", async (result) => {
+        const provider = new EndpointJsonRpcProvider(rpcUrl, 1, providerOptions(() => Promise.resolve(
+            jsonResponse(result, 1),
+        )));
+
+        await expect(provider.send("test", [])).resolves.toEqual(result);
+        provider.destroy();
+    });
+
+    it("rejects invalid JSON as endpoint data without recording a response", async () => {
+        const observer = { onError: vi.fn(), onRequest: vi.fn(), onResponse: vi.fn() };
+        const provider = new EndpointJsonRpcProvider(rpcUrl, 1, {
+            ...providerOptions(() => Promise.resolve(new Response("not json"))),
+            observer,
+        });
+
+        const error = await provider.send("test", []).catch((reason: unknown) => reason);
+
+        expect(getRpcFailure(error)).toMatchObject({ category: "endpoint-data", httpStatus: 200 });
+        expect(observer.onRequest).toHaveBeenCalledOnce();
+        expect(observer.onError).toHaveBeenCalledOnce();
+        expect(observer.onResponse).not.toHaveBeenCalled();
+        provider.destroy();
+    });
+
+    it("rejects every transport entry point locally after destroy", async () => {
+        const request = vi.fn<HttpRequest>();
+        const observer = { onError: vi.fn(), onRequest: vi.fn(), onResponse: vi.fn() };
+        const provider = new EndpointJsonRpcProvider(rpcUrl, 1, { ...providerOptions(request), observer });
+        provider.destroy();
+
+        await expect(provider.send("test", [])).rejects.toMatchObject({ code: "UNSUPPORTED_OPERATION" });
+        await expect(provider.getBlockNumber()).rejects.toMatchObject({ code: "UNSUPPORTED_OPERATION" });
+        await expect(provider._send({ id: 8, jsonrpc: "2.0", method: "test", params: [] }))
+            .rejects.toMatchObject({ code: "UNSUPPORTED_OPERATION" });
+        expect(request).not.toHaveBeenCalled();
+        expect(observer.onRequest).not.toHaveBeenCalled();
+        expect(observer.onError).not.toHaveBeenCalled();
+    });
+
     it("uses the normal ethers error path for responses not produced by its transport", () => {
         const provider = new EndpointJsonRpcProvider(rpcUrl, 1, providerOptions(() => Promise.resolve(
             jsonResponse("0x1", 1),

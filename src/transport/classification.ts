@@ -142,11 +142,18 @@ function classifyHttpResponse(error: RpcTransportResponseError, nowMs: number): 
     }
 
     if (error.jsonRpcError !== undefined) {
-        return classifyJsonRpcError(error.jsonRpcError, error.status, retryAfterMs);
+        const jsonRpcClassification = classifyJsonRpcError(error.jsonRpcError, error.status, retryAfterMs);
+        if (jsonRpcClassification.category !== "unknown") {
+            return jsonRpcClassification;
+        }
     }
 
     if (Math.trunc(error.status / 100) === 5) {
         return cooldown("http-5xx", error.status, retryAfterMs);
+    }
+
+    if (error.invalidResponse) {
+        return cooldown("endpoint-data", error.status, retryAfterMs);
     }
 
     return passThrough("unknown", error.status);

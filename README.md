@@ -150,7 +150,8 @@ await pool.executeOnce(1, async (provider) => {
 Calling `destroy()` or changing provider-wide settings affects every user of that endpoint provider. A provider saved
 and later used outside an execution callback sends requests directly to its fixed endpoint. Such calls use the
 transport request timeout and observability, but do not participate in pool selection, retries, active groups, or an
-earlier operation deadline.
+earlier operation deadline. After `destroy()` or `pool.close()`, a saved provider rejects new network calls locally
+with ethers code `UNSUPPORTED_OPERATION`; no HTTP request or pool transport event is produced.
 
 An execution context closes when its attempt finishes. Asynchronous work that inherited that closed context cannot
 start another managed HTTP request. This boundary applies to network requests; JavaScript work already started by the
@@ -208,6 +209,12 @@ endpoint health. Ethers errors, including contract `CALL_EXCEPTION` errors and r
 object identity and fields. An endpoint becomes eligible for a single probe after its cooldown; successful initial
 measurement or twentieth-selection exploration recovers it. `RpcEndpointDataError` is intentionally different from a
 generic domain error: it explicitly reports unusable endpoint data and applies the endpoint-data cooldown policy.
+
+The transport accepts only a single matching JSON-RPC 2.0 response envelope with exactly one own `result` or `error`
+field. Empty values such as `null`, `false`, `0`, and `""` are valid results. Invalid JSON, mismatched IDs, ambiguous
+envelopes, and malformed errors are endpoint-data failures rather than successful `undefined` results. RPC provenance
+belongs only to the exact error emitted by the transport; wrapping it in a new application error creates a new error
+without that provenance.
 
 ## Snapshot and logger
 

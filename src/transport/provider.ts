@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 
-import { JsonRpcProvider } from "ethers";
+import { JsonRpcProvider, makeError } from "ethers";
 import type {
     JsonRpcError,
     JsonRpcPayload,
@@ -52,14 +52,6 @@ interface TransportResult {
     readonly status: number;
 }
 
-interface PendingRpcFailure {
-    readonly durationMs: number;
-    readonly finishedAt: number;
-    readonly method: string;
-    readonly startedAt: number;
-    readonly transportError: RpcTransportResponseError;
-}
-
 const rpcFailures = new WeakMap<object, RpcErrorClassification>();
 
 function markRpcFailure(error: object, failure: RpcErrorClassification): void {
@@ -75,17 +67,20 @@ export class RpcTransportResponseError extends Error {
     public readonly headers: Readonly<Record<string, string>>;
     public readonly jsonRpcError: Readonly<JsonRpcError["error"]> | undefined;
     public readonly status: number;
+    public readonly invalidResponse: boolean;
 
     public constructor(
         status: number,
         headers: Readonly<Record<string, string>>,
         jsonRpcError: Readonly<JsonRpcError["error"]> | undefined,
         options?: ErrorOptions,
+        invalidResponse = false,
     ) {
         super("RPC transport received an error response", options);
         this.status = status;
         this.headers = headers;
         this.jsonRpcError = jsonRpcError;
+        this.invalidResponse = invalidResponse;
     }
 }
 
@@ -106,7 +101,6 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
     readonly #requestTimeoutMs: number;
     readonly #runtime: RuntimeDependencies;
     readonly #url: string;
-    readonly #pendingRpcFailures = new WeakMap<JsonRpcError, PendingRpcFailure>();
     #nextId = 1;
 
     public constructor(
@@ -157,31 +151,7 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
         };
         // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- _send returns one response per payload.
         const response = (await this._send(payload))[0]!;
-        if ("error" in response) {
-            throw this.getRpcError(payload, response as JsonRpcError);
-        }
-        return response.result;
-    }
-
-    public override getRpcError(payload: JsonRpcPayload, response: JsonRpcError): Error {
-        const error = super.getRpcError(payload, response);
-        const pending = this.#pendingRpcFailures.get(response);
-        if (pending === undefined) {
-            return error;
-        }
-
-        this.#pendingRpcFailures.delete(response);
-        const failure = classifyRpcTransportError(pending.transportError, pending.finishedAt);
-        markRpcFailure(error, failure);
-        this.#observer?.onError(
-            pending.method,
-            error,
-            failure,
-            pending.startedAt,
-            pending.finishedAt,
-            pending.durationMs,
-        );
-        return error;
+        return (response as { readonly result: unknown }).result;
     }
 
     public override async _send(payload: JsonRpcPayload | JsonRpcPayload[]): Promise<JsonRpcResult[]> {
@@ -193,6 +163,9 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
     }
 
     async #sendOne(payload: JsonRpcPayload): Promise<JsonRpcResult> {
+        if (this.destroyed) {
+            throw makeError("provider destroyed", "UNSUPPORTED_OPERATION", { operation: "send" });
+        }
         const context = this.#context.getStore();
         if (context !== undefined) {
             context.signal?.throwIfAborted();
@@ -223,14 +196,18 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
                     transportResult.headers,
                     Object.freeze({ ...(result as JsonRpcError).error }),
                 );
-                this.#pendingRpcFailures.set(result as JsonRpcError, {
-                    durationMs: this.#runtime.monotonicNow() - startedMonotonic,
-                    finishedAt,
-                    method: payload.method,
+                const error = super.getRpcError(payload, result as JsonRpcError);
+                const failure = classifyRpcTransportError(transportError, finishedAt);
+                markRpcFailure(error, failure);
+                this.#observer?.onError(
+                    payload.method,
+                    error,
+                    failure,
                     startedAt,
-                    transportError,
-                });
-                return result;
+                    finishedAt,
+                    this.#runtime.monotonicNow() - startedMonotonic,
+                );
+                throw error;
             }
             this.#observer?.onResponse(
                 payload.method,
@@ -240,6 +217,9 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
             );
             return result;
         } catch (error: unknown) {
+            if (getRpcFailure(error) !== undefined) {
+                throw error;
+            }
             const finishedAt = this.#runtime.epochNow();
             const failure = classifyRpcTransportError(error, finishedAt);
             if (typeof error === "object" && error !== null) {
@@ -296,10 +276,14 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
                     headers,
                     undefined,
                     { cause },
+                    response.ok,
                 );
             }
 
-            const jsonRpcError = (body as Partial<JsonRpcError>).error;
+            const validEnvelope = isJsonRpcResult(body, payload.id);
+            const jsonRpcError = validEnvelope && "error" in (body as JsonRpcResult)
+                ? (body as JsonRpcError).error
+                : undefined;
             if (!response.ok) {
                 throw new RpcTransportResponseError(
                     response.status,
@@ -307,6 +291,16 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
                     jsonRpcError === undefined
                         ? undefined
                         : Object.freeze({ ...jsonRpcError }),
+                );
+            }
+
+            if (!validEnvelope) {
+                throw new RpcTransportResponseError(
+                    response.status,
+                    headers,
+                    undefined,
+                    undefined,
+                    true,
                 );
             }
 
@@ -321,4 +315,28 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
             this.#runtime.clearTimeout(timeout);
         }
     }
+}
+
+function isJsonRpcResult(body: unknown, expectedId: number | string): body is JsonRpcResult {
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+        return false;
+    }
+    const record = body as Record<string, unknown>;
+    if (record.jsonrpc !== "2.0" || record.id !== expectedId) {
+        return false;
+    }
+    const hasResult = Object.hasOwn(record, "result");
+    const hasError = Object.hasOwn(record, "error");
+    if (hasResult === hasError) {
+        return false;
+    }
+    if (!hasError) {
+        return true;
+    }
+    const error = record.error;
+    if (typeof error !== "object" || error === null || Array.isArray(error)) {
+        return false;
+    }
+    const rpcError = error as Record<string, unknown>;
+    return typeof rpcError.code === "number" && Number.isInteger(rpcError.code) && typeof rpcError.message === "string";
 }

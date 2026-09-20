@@ -91,6 +91,17 @@ describe("classifyRpcTransportError", () => {
     });
 
     it.each([
+        [-32_603, "Internal error"],
+        [-31_000, "unclassified"],
+    ])("falls back from unknown JSON-RPC %s to HTTP 5xx", (code, message) => {
+        expectCooldown(responseError(503, code, message), "http-5xx", 503);
+    });
+
+    it("classifies an invalid successful response as endpoint data", () => {
+        expectCooldown(new RpcTransportResponseError(200, noHeaders, undefined, undefined, true), "endpoint-data", 200);
+    });
+
+    it.each([
         [-32_005, "provider limit", "rate-limit"],
         [429, "provider limit", "rate-limit"],
         [-32_000, "rate limit exceeded", "rate-limit"],

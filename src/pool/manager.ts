@@ -21,7 +21,7 @@ import { EndpointReservationUnavailableError } from "./attempt.js";
 import {
     applyEndpointDataCooldown,
     applyLongCooldown,
-    applyShortCooldownWithMinimum,
+    applyShortCooldown,
     excludeEndpoint,
 } from "./cooldown.js";
 import { createRuntime } from "./runtime.js";
@@ -201,7 +201,7 @@ function assertOperationTimeout(timeoutMs: number): void {
     }
 }
 
-async function raceWithAbort<Result>(operation: Promise<Result>, signal: AbortSignal): Promise<Result> {
+async function raceWithAbort<Result>(startOperation: () => Promise<Result>, signal: AbortSignal): Promise<Result> {
     signal.throwIfAborted();
 
     let abort!: () => void;
@@ -212,6 +212,19 @@ async function raceWithAbort<Result>(operation: Promise<Result>, signal: AbortSi
         };
         signal.addEventListener("abort", abort, { once: true });
     });
+
+    let operation: Promise<Result>;
+    try {
+        operation = Promise.resolve(startOperation());
+    } catch (error) {
+        // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- Preserve arbitrary callback rejection.
+        operation = Promise.reject(error);
+    }
+    if (signal.aborted) {
+        void operation.catch(() => undefined);
+        void cancellation.catch(() => undefined);
+        signal.throwIfAborted();
+    }
 
     return await Promise.race([operation, cancellation]).finally(() => {
         signal.removeEventListener("abort", abort);
@@ -385,7 +398,7 @@ export class RpcPoolManager {
                         await endpoint.verifier.verify();
                         options.signal.throwIfAborted();
                         callbackStarted = true;
-                        return await raceWithAbort(callback(endpoint.provider), options.signal);
+                        return await raceWithAbort(() => callback(endpoint.provider), options.signal);
                     }, options.signal, () => isEndpointReservationCurrent(reservation)));
                 this.#emitRecovery(reservation.requiresProbe, endpoint);
                 return result;
@@ -448,7 +461,7 @@ export class RpcPoolManager {
             );
             this.#emitCooldown(endpoint, classification.category, cooldownUntil);
         } else {
-            const cooldownUntil = applyShortCooldownWithMinimum(
+            const cooldownUntil = applyShortCooldown(
                 endpoint,
                 this.#runtime.monotonicNow(),
                 this.#runtime,

@@ -508,6 +508,25 @@ describe("RpcPoolManager operation entry points", () => {
         expect(globalThis.fetch).toHaveBeenCalledOnce();
     });
 
+    it("prevents a saved provider from sending after close", async () => {
+        const request = vi.fn((_input: string | URL | Request, init?: RequestInit) =>
+            Promise.resolve(rpcResponse(init ?? {})));
+        vi.stubGlobal("fetch", request);
+        const manager = new RpcPoolManager(config);
+        let savedProvider: JsonRpcProvider | undefined;
+        await manager.executeOnce(1, (provider) => {
+            savedProvider = provider;
+            return Promise.resolve();
+        });
+        const requestsBeforeClose = request.mock.calls.length;
+
+        await manager.close();
+
+        await expect(savedProvider?.getBlockNumber()).rejects.toMatchObject({ code: "UNSUPPORTED_OPERATION" });
+        await expect(manager.executeOnce(1, () => Promise.resolve())).rejects.toBeInstanceOf(RpcPoolClosedError);
+        expect(request).toHaveBeenCalledTimes(requestsBeforeClose);
+    });
+
     it("clears operation and cooldown wait timers when closed", async () => {
         vi.useFakeTimers();
         const cooldownStarted = deferred<undefined>();
@@ -845,6 +864,42 @@ describe("RpcPoolManager operation entry points", () => {
 
         await expect(operation).rejects.toBe(reason);
         await expect(selectedClient?.getBlockNumber()).resolves.toBe(42);
+    });
+
+    it.each([
+        ["retry", "throw"],
+        ["retry", "reject"],
+        ["retry", "resolve"],
+        ["once", "throw"],
+        ["once", "reject"],
+        ["once", "resolve"],
+    ] as const)("preserves synchronous abort during a %s callback that will %s", async (mode, settlement) => {
+        vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) =>
+            Promise.resolve(rpcResponse(init ?? {}))));
+        const manager = new RpcPoolManager(config);
+        const controller = new AbortController();
+        const reason = new Error("cancelled inside callback");
+        const callbackError = new Error("callback failed after cancellation");
+        const unhandledRejection = vi.fn();
+        process.on("unhandledRejection", unhandledRejection);
+        try {
+            const operation = executeInMode(manager, mode, () => {
+                controller.abort(reason);
+                if (settlement === "throw") {
+                    throw callbackError;
+                }
+                return settlement === "reject"
+                    ? Promise.reject(callbackError)
+                    : Promise.resolve("too late");
+            }, { signal: controller.signal });
+
+            await expect(operation).rejects.toBe(reason);
+            await Promise.resolve();
+            expect(unhandledRejection).not.toHaveBeenCalled();
+            expect(manager.getSnapshot().totalActiveGroups).toBe(0);
+        } finally {
+            process.off("unhandledRejection", unhandledRejection);
+        }
     });
 
     it.each(["retry", "once"] as const)("preserves a pre-aborted reason in %s mode", async (mode) => {

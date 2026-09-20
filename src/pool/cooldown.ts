@@ -45,15 +45,7 @@ export function applyShortCooldown(
     endpoint: EndpointState,
     nowMs: number,
     runtime: Pick<RuntimeDependencies, "random">,
-): number {
-    return applyCooldown(endpoint, nowMs, runtime, shortPolicy, null);
-}
-
-export function applyShortCooldownWithMinimum(
-    endpoint: EndpointState,
-    nowMs: number,
-    runtime: Pick<RuntimeDependencies, "random">,
-    retryAfterMs: number | null,
+    retryAfterMs: number | null = null,
 ): number {
     return applyCooldown(endpoint, nowMs, runtime, shortPolicy, retryAfterMs);
 }
