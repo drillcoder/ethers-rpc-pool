@@ -2,7 +2,7 @@ import { createEndpointCounters, createRpcCounters } from "../../src/observabili
 import type { EndpointState, PoolState } from "../../src/pool/state.js";
 import type { RpcNetworkConfig } from "../../src/pool/types.js";
 
-function createEndpointState(rpcUrl: string, endpointNumber: number): EndpointState {
+function createEndpointState(_rpcUrl: string, endpointNumber: number): EndpointState {
     return {
         activeGroups: 0,
         cooldownUntil: null,
@@ -13,7 +13,6 @@ function createEndpointState(rpcUrl: string, endpointNumber: number): EndpointSt
         latencyEwmaMs: null,
         lastReserved: 0,
         probeToken: null,
-        rpcUrl,
         status: "available",
         version: 0,
     };
@@ -23,7 +22,6 @@ export function createPoolState(networks: readonly RpcNetworkConfig[]): PoolStat
     return {
         counters: createRpcCounters(),
         networks: new Map(networks.map((network) => [network.chainId, {
-            activeGroups: 0,
             chainId: network.chainId,
             endpoints: network.rpcUrls.map((rpcUrl, index) => createEndpointState(rpcUrl, index + 1)),
             primaryRetrySelections: 0,

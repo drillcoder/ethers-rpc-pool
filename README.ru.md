@@ -77,6 +77,32 @@ const blockHex = await pool.executeWithRetry(
 
 Единицей retry является весь callback. Побочные эффекты приложения внутри него должны допускать повторение.
 
+Возможность retry определяется по точному объекту ошибки, который вернул управляемый provider. Если перехватить и
+повторно выбросить тот же объект, для него продолжат действовать обычные правила retry endpoint:
+
+```ts
+await pool.executeWithRetry(1, async (provider) => {
+    try {
+        return await provider.getBlockNumber();
+    } catch (error) {
+        throw error;
+    }
+});
+```
+
+Новое доменное исключение прекращает retry, даже если исходная RPC-ошибка указана в `cause`. Вызывающей стороне будет
+передан новый объект:
+
+```ts
+await pool.executeWithRetry(1, async (provider) => {
+    try {
+        return await provider.getBlockNumber();
+    } catch (error) {
+        throw new Error("Не удалось загрузить панель", { cause: error });
+    }
+});
+```
+
 ## Однократные операции
 
 `executeOnce()` запускает callback один раз. Используйте его для отправки транзакций и других операций, результат
@@ -178,7 +204,10 @@ await operation;
 
 HTTP- или JSON-RPC-ошибка авторизации навсегда исключает endpoint до закрытия менеджера. Временные transport-сбои
 обрабатываются правилами cooldown и recovery. Локальные ошибки callback передаются вызывающей стороне и не меняют
-состояние endpoint.
+состояние endpoint. Ошибки ethers, включая контрактные ошибки `CALL_EXCEPTION` и revert data, сохраняют исходный
+объект и его поля. После cooldown endpoint допускается к единственной проверочной попытке; успешное начальное измерение
+или исследующий двадцатый выбор восстанавливает его. `RpcEndpointDataError` намеренно отличается от обычной доменной
+ошибки: он явно сообщает о непригодных данных endpoint и применяет отдельную политику cooldown.
 
 ## Snapshot и logger
 

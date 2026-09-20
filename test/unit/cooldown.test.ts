@@ -4,8 +4,7 @@ import {
     applyEndpointDataCooldown,
     applyLongCooldown,
     applyShortCooldown,
-    excludeEndpointForAuthorization,
-    excludeEndpointForChainIdMismatch,
+    excludeEndpoint,
 } from "../../src/pool/cooldown.js";
 import { getEndpointCandidates } from "../../src/pool/state.js";
 import type { EndpointState } from "../../src/pool/state.js";
@@ -32,7 +31,6 @@ describe("applyShortCooldown", () => {
         expect(endpoint.cooldownUntil).toBe(6_000);
         expect(endpoint.failureStreaks).toEqual({ long: 0, short: 1 });
         expect(getEndpointCandidates({
-            activeGroups: 0,
             chainId: 1,
             endpoints: [endpoint],
             primaryRetrySelections: 0,
@@ -92,7 +90,6 @@ describe("authorization and endpoint-data failures", () => {
     it("permanently excludes an unauthorized endpoint without a recovery deadline", () => {
         const endpoint = createEndpoint();
         const network = {
-            activeGroups: 0,
             chainId: 1,
             endpoints: [endpoint],
             primaryRetrySelections: 0,
@@ -101,7 +98,7 @@ describe("authorization and endpoint-data failures", () => {
         };
 
         endpoint.cooldownUntil = 10_000;
-        excludeEndpointForAuthorization(endpoint);
+        excludeEndpoint(endpoint, "authorization");
 
         expect(endpoint.status).toBe("excluded");
         expect(endpoint.excludedReason).toBe("authorization");
@@ -113,13 +110,13 @@ describe("authorization and endpoint-data failures", () => {
         const endpoint = createEndpoint();
 
         endpoint.cooldownUntil = 10_000;
-        excludeEndpointForChainIdMismatch(endpoint);
+        excludeEndpoint(endpoint, "chain-id-mismatch");
 
         expect(endpoint.status).toBe("excluded");
         expect(endpoint.excludedReason).toBe("chain-id-mismatch");
         expect(endpoint.cooldownUntil).toBeNull();
         expect(endpoint.version).toBe(1);
-        excludeEndpointForChainIdMismatch(endpoint);
+        excludeEndpoint(endpoint, "chain-id-mismatch");
         expect(endpoint.version).toBe(1);
     });
 
@@ -145,7 +142,7 @@ describe("authorization and endpoint-data failures", () => {
         expect(applyShortCooldown(endpoint, 1_000, { random })).toBe(1_000);
         expect(applyLongCooldown(endpoint, 2_000, { random })).toBe(2_000);
         expect(applyEndpointDataCooldown(endpoint, 3_000, { random })).toBe(3_000);
-        excludeEndpointForAuthorization(endpoint);
+        excludeEndpoint(endpoint, "authorization");
 
         expect(endpoint.status).toBe("excluded");
         expect(endpoint.excludedReason).toBe("chain-id-mismatch");

@@ -10,7 +10,7 @@ import {
     RpcPoolManager,
     UnknownNetworkError,
 } from "../../src/index.js";
-import { EndpointJsonRpcProvider, RpcTransportResponseError } from "../../src/transport/provider.js";
+import { EndpointJsonRpcProvider } from "../../src/transport/provider.js";
 import type {
     RpcExecutionOptions,
     RpcPoolLoggerEvent,
@@ -1071,8 +1071,8 @@ describe("RpcPoolManager operation entry points", () => {
                 ? manager.executeWithRetry(1, callback)
                 : manager.executeOnce(1, callback)
             ).catch((error: unknown) => error);
-            expect(failure).toBeInstanceOf(RpcTransportResponseError);
-            expect(failure).toMatchObject({ jsonRpcError: { code, message }, status: 200 });
+            expect(failure).toBeInstanceOf(Error);
+            expect(failure).toMatchObject({ error: { code, message } });
             expect(callback).toHaveBeenCalledOnce();
             expect(methods).toEqual(["eth_chainId", "eth_blockNumber"]);
             await expect(manager.executeOnce(1, () => Promise.resolve("available"))).resolves.toBe("available");
@@ -1223,6 +1223,75 @@ describe("RpcPoolManager operation entry points", () => {
         const domainCallback = vi.fn(() => Promise.reject(failure));
         await expect(manager.executeWithRetry(1, domainCallback)).rejects.toBe(failure);
         expect(domainCallback).toHaveBeenCalledOnce();
+    });
+
+    it("does not inherit RPC provenance through a new callback error cause", async () => {
+        vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+            const payload = JSON.parse(init?.body as string) as { id: number; method: string };
+            if (payload.method === "eth_chainId") {
+                return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x1" }));
+            }
+            return Promise.resolve(Response.json({
+                error: { code: -32_005, message: "rate limit exceeded" },
+                id: payload.id,
+                jsonrpc: "2.0",
+            }));
+        }));
+        const manager = new RpcPoolManager(config);
+        let rpcError: unknown;
+        const callback = vi.fn(async (client: JsonRpcProvider) => {
+            try {
+                await client.send("eth_blockNumber", []);
+            } catch (error: unknown) {
+                rpcError = error;
+                throw new Error("domain failure", { cause: error });
+            }
+        });
+
+        const failure = await manager.executeWithRetry(1, callback).catch((error: unknown) => error);
+
+        expect(failure).toBeInstanceOf(Error);
+        expect((failure as Error).cause).toBe(rpcError);
+        expect(callback).toHaveBeenCalledOnce();
+        expect(manager.getSnapshot().errorsByCategory).toEqual({ "rate-limit": 1 });
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]?.status).toBe("available");
+    });
+
+    it("retains RPC provenance when the callback rethrows the exact provider error", async () => {
+        let blockRequests = 0;
+        vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+            const payload = JSON.parse(init?.body as string) as { id: number; method: string };
+            if (payload.method === "eth_chainId") {
+                return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x1" }));
+            }
+            blockRequests += 1;
+            return Promise.resolve(blockRequests === 1
+                ? Response.json({
+                    error: { code: -32_005, message: "rate limit exceeded" },
+                    id: payload.id,
+                    jsonrpc: "2.0",
+                })
+                : Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x2a" }));
+        }));
+        const manager = new RpcPoolManager({
+            ...config,
+            networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
+        });
+        let firstError: unknown;
+        const callback = vi.fn(async (client: JsonRpcProvider) => {
+            try {
+                return await client.getBlockNumber();
+            } catch (error: unknown) {
+                firstError ??= error;
+                throw error;
+            }
+        });
+
+        await expect(manager.executeWithRetry(1, callback)).resolves.toBe(42);
+
+        expect(firstError).toBeInstanceOf(Error);
+        expect(callback).toHaveBeenCalledTimes(2);
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]?.status).toBe("cooling-down");
     });
 
     it("switches endpoints after chain verification failure without starting the single callback twice", async () => {

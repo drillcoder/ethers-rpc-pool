@@ -14,16 +14,15 @@ import {
 } from "../observability/counters.js";
 import type { RpcErrorCategory, RpcPoolLogger, RpcPoolLoggerEvent, RpcPoolSnapshot } from "../observability/types.js";
 import { EndpointChainIdVerifier, RpcChainIdMismatchError } from "../transport/chain-id.js";
-import { classifyRpcTransportError } from "../transport/classification.js";
-import { EndpointJsonRpcProvider, getRpcOriginError } from "../transport/provider.js";
+import type { RpcErrorClassification } from "../transport/classification.js";
+import { EndpointJsonRpcProvider, getRpcFailure } from "../transport/provider.js";
 import { normalizeManagerConfig } from "./config.js";
 import { EndpointReservationUnavailableError } from "./attempt.js";
 import {
     applyEndpointDataCooldown,
     applyLongCooldown,
-    applyShortCooldown,
-    excludeEndpointForAuthorization,
-    excludeEndpointForChainIdMismatch,
+    applyShortCooldownWithMinimum,
+    excludeEndpoint,
 } from "./cooldown.js";
 import { createRuntime } from "./runtime.js";
 import type { RuntimeDependencies, TimerHandle } from "./runtime.js";
@@ -61,7 +60,7 @@ class ManagedEndpoint implements EndpointState {
 
     public constructor(
         public readonly endpointNumber: number,
-        public readonly rpcUrl: string,
+        rpcUrl: string,
         chainId: number,
         requestTimeoutMs: number,
         counters: PoolState["counters"],
@@ -74,10 +73,12 @@ class ManagedEndpoint implements EndpointState {
         this.#runtime = runtime;
         this.provider = new EndpointJsonRpcProvider(rpcUrl, chainId, {
             observer: {
-                onError: (method, error, startedAt, finishedAt, durationMs) => {
-                    const classification = classifyRpcTransportError(error, finishedAt);
+                onError: (method, _error, classification, startedAt, finishedAt, durationMs) => {
                     recordRpcError(counters, this.counters, classification.category);
                     updateEndpointLatency(this, durationMs);
+                    if (this.#logger === undefined) {
+                        return;
+                    }
                     this.#emit({
                         ...this.#transportEvent("error", method, startedAt, finishedAt),
                         category: classification.category,
@@ -90,6 +91,9 @@ class ManagedEndpoint implements EndpointState {
                 },
                 onRequest: (method, startedAt) => {
                     recordRpcRequest(counters, this.counters, method);
+                    if (this.#logger === undefined) {
+                        return;
+                    }
                     this.#emit({
                         ...this.#baseEvent("request", startedAt),
                         method,
@@ -98,6 +102,9 @@ class ManagedEndpoint implements EndpointState {
                 },
                 onResponse: (method, startedAt, finishedAt, durationMs) => {
                     updateEndpointLatency(this, durationMs);
+                    if (this.#logger === undefined) {
+                        return;
+                    }
                     this.#emit({
                         ...this.#transportEvent("response", method, startedAt, finishedAt),
                         durationMs,
@@ -111,6 +118,10 @@ class ManagedEndpoint implements EndpointState {
 
     public emit(event: RpcPoolLoggerEvent): void {
         this.#emit(event);
+    }
+
+    public get loggingEnabled(): boolean {
+        return this.#logger !== undefined;
     }
 
     public eventBase<Type extends RpcPoolLoggerEvent["type"]>(type: Type): {
@@ -233,7 +244,6 @@ export class RpcPoolManager {
                     normalized.logger,
                 ));
                 const state: NetworkState<ManagedEndpoint> = {
-                    activeGroups: 0,
                     chainId: network.chainId,
                     endpoints,
                     primaryRetrySelections: 0,
@@ -314,10 +324,9 @@ export class RpcPoolManager {
             errorsByCategory,
             networks: Object.freeze(networks),
             requestsByMethod,
-            totalActiveGroups: [...this.#state.networks.values()].reduce(
-                (total, network) => total + network.activeGroups,
-                0,
-            ),
+            totalActiveGroups: [...this.#state.networks.values()].reduce((total, network) =>
+                total + network.endpoints.reduce((networkTotal, endpoint) =>
+                    networkTotal + endpoint.activeGroups, 0), 0),
             totalRequests: this.#state.counters.totalRequests,
         });
     }
@@ -342,7 +351,6 @@ export class RpcPoolManager {
                 network,
                 callback,
                 operationOptions,
-                timeoutMs,
                 deadlineMs,
                 mode,
             );
@@ -355,7 +363,6 @@ export class RpcPoolManager {
         network: NetworkState<ManagedEndpoint>,
         callback: (client: EndpointJsonRpcProvider) => Promise<Result>,
         options: OperationOptions,
-        timeoutMs: number,
         deadlineMs: number,
         mode: ExecutionMode,
     ): Promise<Result> {
@@ -365,7 +372,7 @@ export class RpcPoolManager {
             options.signal.throwIfAborted();
             const reservation = reserveEndpoint(network, this.#runtime.monotonicNow(), mode, primaryAttempt);
             if (reservation === null) {
-                await this.#waitForEndpoint(network, options, timeoutMs, deadlineMs);
+                await this.#waitForEndpoint(network, options);
                 continue;
             }
 
@@ -411,24 +418,27 @@ export class RpcPoolManager {
             return { category: "endpoint-data", error, retry: mode === "retry" };
         }
         if (error instanceof RpcChainIdMismatchError) {
-            excludeEndpointForChainIdMismatch(endpoint);
+            excludeEndpoint(endpoint, "chain-id-mismatch");
             return { category: "endpoint-data", error, retry: true };
         }
-        const transportError = getRpcOriginError(error);
-        if (transportError === undefined) {
+        const failure = getRpcFailure(error);
+        if (failure === undefined) {
             return { category: "unknown", error, retry: false };
         }
-        const decision = this.#applyTransportFailure(endpoint, transportError);
+        const decision = this.#applyTransportFailure(endpoint, error, failure);
         return mode === "once" && callbackStarted ? { ...decision, retry: false } : decision;
     }
 
-    #applyTransportFailure(endpoint: ManagedEndpoint, transportError: unknown): RetryDecision {
-        const classification = classifyRpcTransportError(transportError, this.#runtime.epochNow());
-        if (!classification.retryable) {
-            return { category: classification.category, error: transportError, retry: false };
+    #applyTransportFailure(
+        endpoint: ManagedEndpoint,
+        error: unknown,
+        classification: RpcErrorClassification,
+    ): RetryDecision {
+        if (classification.action === "none") {
+            return { category: classification.category, error, retry: false };
         }
         if (classification.action === "exclude") {
-            excludeEndpointForAuthorization(endpoint);
+            excludeEndpoint(endpoint, "authorization");
         } else if (classification.category === "rate-limit" || classification.category === "quota-limit") {
             const cooldownUntil = applyLongCooldown(
                 endpoint,
@@ -438,13 +448,21 @@ export class RpcPoolManager {
             );
             this.#emitCooldown(endpoint, classification.category, cooldownUntil);
         } else {
-            const cooldownUntil = applyShortCooldown(endpoint, this.#runtime.monotonicNow(), this.#runtime);
+            const cooldownUntil = applyShortCooldownWithMinimum(
+                endpoint,
+                this.#runtime.monotonicNow(),
+                this.#runtime,
+                classification.retryAfterMs ?? null,
+            );
             this.#emitCooldown(endpoint, classification.category, cooldownUntil);
         }
-        return { category: classification.category, error: transportError, retry: true };
+        return { category: classification.category, error, retry: true };
     }
 
     #emitCooldown(endpoint: ManagedEndpoint, category: RpcErrorCategory, cooldownUntil: number): void {
+        if (!endpoint.loggingEnabled) {
+            return;
+        }
         endpoint.emit({
             ...endpoint.eventBase("cooldown"),
             category,
@@ -453,13 +471,13 @@ export class RpcPoolManager {
     }
 
     #emitRecovery(requiresProbe: boolean, endpoint: ManagedEndpoint): void {
-        if (requiresProbe && endpoint.status === "available") {
+        if (requiresProbe && endpoint.status === "available" && endpoint.loggingEnabled) {
             endpoint.emit(endpoint.eventBase("recovery"));
         }
     }
 
     #emitSwitch(previousFailure: PreviousFailure | undefined, endpoint: ManagedEndpoint): void {
-        if (previousFailure === undefined || previousFailure.endpoint === endpoint) {
+        if (previousFailure === undefined || previousFailure.endpoint === endpoint || !previousFailure.endpoint.loggingEnabled) {
             return;
         }
         previousFailure.endpoint.emit({
@@ -470,17 +488,10 @@ export class RpcPoolManager {
         });
     }
 
-    async #waitForEndpoint(
-        network: NetworkState<ManagedEndpoint>,
-        options: OperationOptions,
-        timeoutMs: number,
-        deadlineMs: number,
-    ): Promise<void> {
+    async #waitForEndpoint(network: NetworkState<ManagedEndpoint>, options: OperationOptions,): Promise<void> {
         await waitForEndpointAvailability(network, {
-            deadlineMs,
             runtime: this.#runtime,
             signal: options.signal,
-            timeoutMs,
         });
     }
 

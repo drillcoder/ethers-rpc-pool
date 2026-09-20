@@ -60,6 +60,7 @@ describe("RPC counters", () => {
         expect(onError).toHaveBeenCalledWith(
             "eth_chainId",
             failure,
+            { action: "cooldown", category: "network", httpStatus: null },
             expect.any(Number),
             expect.any(Number),
             expect.any(Number),

@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
     EndpointJsonRpcProvider,
-    getRpcOriginError,
+    getRpcFailure,
     RpcRequestTimeoutError,
     RpcTransportResponseError,
 } from "../../src/transport/provider.js";
@@ -27,6 +27,20 @@ function providerOptions(request: HttpRequest) {
 }
 
 describe("EndpointJsonRpcProvider", () => {
+    it("uses the normal ethers error path for responses not produced by its transport", () => {
+        const provider = new EndpointJsonRpcProvider(rpcUrl, 1, providerOptions(() => Promise.resolve(
+            jsonResponse("0x1", 1),
+        )));
+        const error = provider.getRpcError(
+            { id: 1, jsonrpc: "2.0", method: "eth_blockNumber", params: [] },
+            { error: { code: -32_601, message: "method not found" }, id: 1 },
+        );
+
+        expect(error).toBeInstanceOf(Error);
+        expect(getRpcFailure(error)).toBeUndefined();
+        provider.destroy();
+    });
+
     it("forwards an already aborted operation signal to the request", async () => {
         const controller = new AbortController();
         const reason = new Error("already aborted");
@@ -134,15 +148,16 @@ describe("EndpointJsonRpcProvider", () => {
         provider.destroy();
     });
 
-    it("preserves provenance through an explicit cause chain only", async () => {
+    it("preserves provenance only for the exact RPC error object", async () => {
         const failure = new TypeError("connection reset");
         const provider = new EndpointJsonRpcProvider(rpcUrl, 1, providerOptions(() => Promise.reject(failure)));
         const origin = await provider.send("eth_blockNumber", []).catch((reason: unknown) => reason);
-        expect(getRpcOriginError(new Error("wrapper", { cause: origin }))).toBe(failure);
-        expect(getRpcOriginError(new Error("local"))).toBeUndefined();
+        expect(getRpcFailure(origin)).toMatchObject({ action: "cooldown", category: "network" });
+        expect(getRpcFailure(new Error("wrapper", { cause: origin }))).toBeUndefined();
+        expect(getRpcFailure(new Error("local"))).toBeUndefined();
         const cyclic: { cause?: unknown } = {};
         cyclic.cause = cyclic;
-        expect(getRpcOriginError(cyclic)).toBeUndefined();
+        expect(getRpcFailure(cyclic)).toBeUndefined();
         provider.destroy();
     });
 
@@ -150,7 +165,7 @@ describe("EndpointJsonRpcProvider", () => {
         // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- Exercise an arbitrary fetch rejection.
         const provider = new EndpointJsonRpcProvider(rpcUrl, 1, providerOptions(() => Promise.reject("offline")));
         await expect(provider.send("eth_blockNumber", [])).rejects.toBe("offline");
-        expect(getRpcOriginError("offline")).toBeUndefined();
+        expect(getRpcFailure("offline")).toBeUndefined();
         provider.destroy();
     });
 
@@ -242,11 +257,11 @@ describe("EndpointJsonRpcProvider", () => {
         );
 
         const error = await provider.send("eth_blockNumber", []).catch((reason: unknown) => reason);
-        const origin = getRpcOriginError(error) as RpcTransportResponseError;
-        expect(origin).toMatchObject({ jsonRpcError: rpcError, status: 200 });
-        expect(
-            Object.isFrozen(origin.jsonRpcError),
-        ).toBe(true);
+        expect(getRpcFailure(error)).toEqual({
+            action: "cooldown",
+            category: "rate-limit",
+            httpStatus: 200,
+        });
 
         provider.destroy();
     });

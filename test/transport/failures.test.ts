@@ -39,6 +39,8 @@ const cases: readonly FailureCase[] = [
         category: "rate-limit",
         error: { code: -32_005, message: "rate limit exceeded" },
         excluded: false,
+        headers: { "retry-after": "45" },
+        minimumCooldownMs: 45_000,
         name: "JSON-RPC rate limit at HTTP 200",
         status: 200,
     },
@@ -75,7 +77,11 @@ describe("RPC transport failure matrix", () => {
         enqueueRpcResult(second, "0x1");
         enqueueRpcResult(second, "0x2a");
         const startedAt = Date.now();
+        const events: unknown[] = [];
         const manager = new RpcPoolManager({
+            logger: (event) => {
+                events.push(event);
+            },
             networks: [{ chainId: 1, rpcUrls: [first.url, second.url] }],
             operationTimeoutMs: 2_000,
             requestTimeoutMs: 1_000,
@@ -87,6 +93,12 @@ describe("RPC transport failure matrix", () => {
         const failedEndpoint = manager.getSnapshot().networks[0]?.endpoints[0];
         expect(callback).toHaveBeenCalledTimes(2);
         expect(manager.getSnapshot().errorsByCategory).toEqual({ [failure.category]: 1 });
+        expect(events).toContainEqual(expect.objectContaining({
+            category: failure.category,
+            httpStatus: failure.status,
+            type: "error",
+            ...(failure.minimumCooldownMs === 45_000 ? { retryAfterMs: 45_000 } : {}),
+        }));
         expect(failedEndpoint).toMatchObject({
             excludedReason: failure.excluded ? "authorization" : null,
             status: failure.excluded ? "excluded" : "cooling-down",

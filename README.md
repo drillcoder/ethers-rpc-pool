@@ -78,6 +78,31 @@ const blockHex = await pool.executeWithRetry(
 
 The entire callback is the retry unit. Application side effects performed inside it must therefore be safe to repeat.
 
+RPC retry eligibility follows the exact error object returned by the managed provider. Catching and rethrowing that
+same object keeps the endpoint failure eligible for the normal retry policy:
+
+```ts
+await pool.executeWithRetry(1, async (provider) => {
+    try {
+        return await provider.getBlockNumber();
+    } catch (error) {
+        throw error;
+    }
+});
+```
+
+Throwing a new domain error, even with the RPC error as its `cause`, stops retry and passes the new error through:
+
+```ts
+await pool.executeWithRetry(1, async (provider) => {
+    try {
+        return await provider.getBlockNumber();
+    } catch (error) {
+        throw new Error("Unable to load the dashboard", { cause: error });
+    }
+});
+```
+
 ## Single-attempt operations
 
 `executeOnce()` starts the callback once. Use it for transaction submission and other operations whose result may be
@@ -179,7 +204,10 @@ The package exports these error classes:
 
 An HTTP or JSON-RPC authorization failure permanently excludes that endpoint for the lifetime of the manager.
 Temporary transport failures use cooldown and recovery rules. Local callback errors pass through without changing
-endpoint health.
+endpoint health. Ethers errors, including contract `CALL_EXCEPTION` errors and revert data, retain their original
+object identity and fields. An endpoint becomes eligible for a single probe after its cooldown; successful initial
+measurement or twentieth-selection exploration recovers it. `RpcEndpointDataError` is intentionally different from a
+generic domain error: it explicitly reports unusable endpoint data and applies the endpoint-data cooldown policy.
 
 ## Snapshot and logger
 

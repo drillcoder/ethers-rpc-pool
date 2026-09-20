@@ -30,7 +30,6 @@ function expectCooldown(
         action: "cooldown",
         category,
         httpStatus,
-        retryable: true,
     });
 }
 
@@ -65,7 +64,6 @@ describe("classifyRpcTransportError", () => {
                 action: "exclude",
                 category: "authorization",
                 httpStatus: status,
-                retryable: true,
             });
         },
     );
@@ -80,7 +78,6 @@ describe("classifyRpcTransportError", () => {
                 action: "exclude",
                 category: "authorization",
                 httpStatus: 200,
-                retryable: true,
             });
         },
     );
@@ -90,7 +87,6 @@ describe("classifyRpcTransportError", () => {
             action: "exclude",
             category: "authorization",
             httpStatus: 503,
-            retryable: true,
         });
     });
 
@@ -125,7 +121,6 @@ describe("classifyRpcTransportError", () => {
                 action: "none",
                 category,
                 httpStatus: 200,
-                retryable: false,
             });
         },
     );
@@ -137,7 +132,6 @@ describe("classifyRpcTransportError", () => {
                 action: "none",
                 category: "unknown",
                 httpStatus: status,
-                retryable: false,
             });
         },
     );
@@ -147,7 +141,6 @@ describe("classifyRpcTransportError", () => {
             action: "none",
             category: "unknown",
             httpStatus: 200,
-            retryable: false,
         });
     });
 
@@ -192,7 +185,6 @@ describe("parseRetryAfter", () => {
             category: "rate-limit",
             httpStatus: 429,
             retryAfterMs: 600_000,
-            retryable: true,
         });
     });
 
@@ -208,7 +200,6 @@ describe("parseRetryAfter", () => {
             category: "quota-limit",
             httpStatus: 200,
             retryAfterMs: 60_000,
-            retryable: true,
         });
     });
 
@@ -219,7 +210,6 @@ describe("parseRetryAfter", () => {
             action: "exclude",
             category: "authorization",
             httpStatus: 401,
-            retryable: true,
         });
     });
 });

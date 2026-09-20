@@ -9,17 +9,14 @@ interface RpcErrorClassificationBase {
 export interface RpcCooldownClassification extends RpcErrorClassificationBase {
     readonly action: "cooldown";
     readonly retryAfterMs?: number;
-    readonly retryable: true;
 }
 
 export interface RpcExcludeClassification extends RpcErrorClassificationBase {
     readonly action: "exclude";
-    readonly retryable: true;
 }
 
 export interface RpcPassThroughClassification extends RpcErrorClassificationBase {
     readonly action: "none";
-    readonly retryable: false;
 }
 
 export type RpcErrorClassification =
@@ -65,7 +62,6 @@ function cooldown(
         action: "cooldown",
         category,
         httpStatus,
-        retryable: true,
     } as const;
 
     return retryAfterMs === null
@@ -78,7 +74,6 @@ function exclude(category: RpcErrorCategory, httpStatus: number | null): RpcExcl
         action: "exclude",
         category,
         httpStatus,
-        retryable: true,
     });
 }
 
@@ -87,7 +82,6 @@ function passThrough(category: RpcErrorCategory, httpStatus: number | null): Rpc
         action: "none",
         category,
         httpStatus,
-        retryable: false,
     });
 }
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { applyShortCooldown, excludeEndpointForAuthorization } from "../../src/pool/cooldown.js";
+import { applyShortCooldown, excludeEndpoint } from "../../src/pool/cooldown.js";
 import {
     getEndpointCandidates,
     isEndpointReservationCurrent,
@@ -29,7 +29,6 @@ describe("createPoolState", () => {
         });
         expect(state.networks.get(1)).toEqual({
             chainId: 1,
-            activeGroups: 0,
             primaryRetrySelections: 0,
             reservationClock: 0,
             selectionCursor: 0,
@@ -37,7 +36,6 @@ describe("createPoolState", () => {
                 {
                     counters: { errorCount: 0, requestCount: 0 },
                     endpointNumber: 1,
-                    rpcUrl: "https://first.example/",
                     activeGroups: 0,
                     cooldownUntil: null,
                     excludedReason: null,
@@ -51,7 +49,6 @@ describe("createPoolState", () => {
                 {
                     counters: { errorCount: 0, requestCount: 0 },
                     endpointNumber: 2,
-                    rpcUrl: "https://second.example/",
                     activeGroups: 0,
                     cooldownUntil: null,
                     excludedReason: null,
@@ -145,10 +142,8 @@ describe("reserveEndpoint", () => {
 
         expect(reserveEndpoint(network, 0)?.endpoint).toBe(first);
         expect(first.activeGroups).toBe(3);
-        expect(network.activeGroups).toBe(1);
 
         first.activeGroups = 5;
-        network.activeGroups = 0;
         expect(reserveEndpoint(network, 0)?.endpoint).toBe(second);
     });
 
@@ -179,7 +174,6 @@ describe("reserveEndpoint", () => {
         expect(reserveEndpoint(network, 0, "retry", true)?.endpoint).toBe(first);
         first.activeGroups = 0;
         first.latencyEwmaMs = 1;
-        network.activeGroups = 0;
         expect(reserveEndpoint(network, 0, "retry", true)?.endpoint).toBe(second);
     });
 
@@ -196,7 +190,6 @@ describe("reserveEndpoint", () => {
         second.latencyEwmaMs = 50;
         expect(reserveEndpoint(network, 0)?.endpoint).toBe(first);
         first.activeGroups = 0;
-        network.activeGroups = 0;
         expect(reserveEndpoint(network, 0)?.endpoint).toBe(second);
     });
 
@@ -214,7 +207,6 @@ describe("reserveEndpoint", () => {
             if (reservation === null) throw new Error("Expected reservation");
             selected.push(reservation.endpoint.endpointNumber);
             reservation.endpoint.activeGroups = 0;
-            network.activeGroups = 0;
         }
 
         expect(selected.filter((endpointNumber) => endpointNumber === 2)).toHaveLength(2);
@@ -231,14 +223,12 @@ describe("reserveEndpoint", () => {
         first.latencyEwmaMs = 10;
         second.latencyEwmaMs = 100;
         second.activeGroups = 1;
-        network.activeGroups = 1;
         network.primaryRetrySelections = 19;
 
         expect(reserveEndpoint(network, 0, "retry", true)?.endpoint).toBe(first);
         expect(network.primaryRetrySelections).toBe(20);
         first.activeGroups = 0;
         second.activeGroups = 0;
-        network.activeGroups = 0;
         expect(reserveEndpoint(network, 0, "retry", true)?.endpoint).toBe(first);
         expect(network.primaryRetrySelections).toBe(21);
     });
@@ -251,16 +241,49 @@ describe("reserveEndpoint", () => {
 
         expect(reserveEndpoint(network, 0, "retry", true)?.endpoint).toBe(first);
         first.activeGroups = 0;
-        network.activeGroups = 0;
         expect(network.primaryRetrySelections).toBe(0);
         first.latencyEwmaMs = 10;
         second.latencyEwmaMs = 20;
         reserveEndpoint(network, 0, "once", true);
         first.activeGroups = 0;
         second.activeGroups = 0;
-        network.activeGroups = 0;
         reserveEndpoint(network, 0, "retry", false);
         expect(network.primaryRetrySelections).toBe(0);
+    });
+
+    it("uses an unmeasured expired-cooldown endpoint for initial collection", () => {
+        const network = createNetwork();
+        const first = network.endpoints[0];
+        const second = network.endpoints[1];
+        if (first === undefined || second === undefined) throw new Error("Expected test endpoints");
+        first.latencyEwmaMs = 10;
+        second.status = "cooling-down";
+        second.cooldownUntil = 100;
+
+        const reservation = reserveEndpoint(network, 100, "retry", true);
+
+        expect(reservation?.endpoint).toBe(second);
+        expect(reservation?.requiresProbe).toBe(true);
+        expect(network.primaryRetrySelections).toBe(0);
+    });
+
+    it("allows an expired-cooldown endpoint to take the twentieth exploration slot", () => {
+        const network = createNetwork();
+        const first = network.endpoints[0];
+        const second = network.endpoints[1];
+        if (first === undefined || second === undefined) throw new Error("Expected test endpoints");
+        first.latencyEwmaMs = 10;
+        second.latencyEwmaMs = 100;
+        second.status = "cooling-down";
+        second.cooldownUntil = 100;
+        network.primaryRetrySelections = 19;
+
+        const reservation = reserveEndpoint(network, 100, "retry", true);
+
+        expect(reservation?.endpoint).toBe(second);
+        expect(reservation?.requiresProbe).toBe(true);
+        expect(second.status).toBe("probe");
+        expect(network.primaryRetrySelections).toBe(20);
     });
 
     it("returns null when no endpoint is available", () => {
@@ -271,7 +294,6 @@ describe("reserveEndpoint", () => {
         }
 
         expect(reserveEndpoint(network, 0)).toBeNull();
-        expect(network.activeGroups).toBe(0);
     });
 
     it("recognizes current normal and probe reservations and rejects stale versions or tokens", () => {
@@ -312,7 +334,6 @@ describe("candidate inspection and reservation", () => {
         expect(first.status).toBe("cooling-down");
         expect(first.probeToken).toBeNull();
         expect(first.activeGroups).toBe(0);
-        expect(network.activeGroups).toBe(0);
         expect(network.selectionCursor).toBe(0);
     });
 
@@ -368,7 +389,6 @@ describe("candidate inspection and reservation", () => {
         expect(endpoint.failureStreaks).toEqual({ long: 0, short: 0 });
         expect(endpoint.probeToken).toBeNull();
         expect(endpoint.activeGroups).toBe(0);
-        expect(network.activeGroups).toBe(0);
     });
 
     it("releases a successful ordinary reservation without changing endpoint health", async () => {
@@ -383,7 +403,6 @@ describe("candidate inspection and reservation", () => {
             .resolves.toBe(42);
         expect(reservation.endpoint.status).toBe("available");
         expect(reservation.endpoint.activeGroups).toBe(0);
-        expect(network.activeGroups).toBe(0);
     });
 
     it("extends cooldown after a failed probe and always releases its slot", async () => {
@@ -422,7 +441,6 @@ describe("candidate inspection and reservation", () => {
         expect(endpoint.failureStreaks.short).toBe(2);
         expect(endpoint.probeToken).toBeNull();
         expect(endpoint.activeGroups).toBe(0);
-        expect(network.activeGroups).toBe(0);
     });
 
     it("releases the probe slot when the operation rejects during cancellation", async () => {
@@ -452,7 +470,6 @@ describe("candidate inspection and reservation", () => {
         expect(endpoint.status).toBe("cooling-down");
         expect(endpoint.probeToken).toBeNull();
         expect(endpoint.activeGroups).toBe(0);
-        expect(network.activeGroups).toBe(0);
     });
 
     it("does not let a late probe success erase a newer cooldown", async () => {
@@ -470,7 +487,7 @@ describe("candidate inspection and reservation", () => {
     it("does not let a late probe success reverse permanent exclusion", async () => {
         const { endpoint, network, reservation } = reserveExpiredProbe();
 
-        excludeEndpointForAuthorization(endpoint);
+        excludeEndpoint(endpoint, "authorization");
         await runEndpointReservation(network, reservation, () => Promise.resolve());
 
         expect(endpoint.status).toBe("excluded");

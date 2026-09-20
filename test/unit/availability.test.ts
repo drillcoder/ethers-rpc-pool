@@ -35,13 +35,11 @@ function getEndpoints(network: NetworkState): readonly [EndpointState, EndpointS
     return [first, second];
 }
 
-function createWaitOptions(timeoutMs: number, signal?: AbortSignal) {
-    const options = {
-        deadlineMs: Date.now() + timeoutMs,
+function createWaitOptions(_timeoutMs: number, signal = new AbortController().signal) {
+    return {
         runtime: createRuntime({ monotonicNow: () => Date.now() }),
-        timeoutMs,
+        signal,
     };
-    return signal === undefined ? options : { ...options, signal };
 }
 
 describe("waitForEndpointAvailability", () => {
@@ -94,8 +92,13 @@ describe("waitForEndpointAvailability", () => {
             endpoint.cooldownUntil = 200;
         }
 
-        const waiting = waitForEndpointAvailability(network, createWaitOptions(50));
-        const rejection = expect(waiting).rejects.toEqual(new OperationTimeoutError(1, 50));
+        const controller = new AbortController();
+        const timeout = new OperationTimeoutError(1, 50);
+        setTimeout(() => {
+            controller.abort(timeout);
+        }, 50);
+        const waiting = waitForEndpointAvailability(network, createWaitOptions(50, controller.signal));
+        const rejection = expect(waiting).rejects.toBe(timeout);
         await vi.advanceTimersByTimeAsync(50);
 
         await rejection;

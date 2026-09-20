@@ -1,4 +1,4 @@
-import { NoUsableRpcEndpointError, OperationTimeoutError } from "../errors/errors.js";
+import { NoUsableRpcEndpointError } from "../errors/errors.js";
 import type { EndpointCounters, RpcCounters } from "../observability/counters.js";
 import type { RpcEndpointExcludedReason, RpcEndpointStatus } from "../observability/types.js";
 import type { RuntimeDependencies, TimerHandle } from "./runtime.js";
@@ -14,10 +14,9 @@ export interface EndpointFailureStreaks {
 export type EndpointProbeToken = symbol;
 
 export interface EndpointState {
+    activeGroups: number;
     readonly counters: EndpointCounters;
     readonly endpointNumber: number;
-    readonly rpcUrl: string;
-    activeGroups: number;
     cooldownUntil: number | null;
     excludedReason: RpcEndpointExcludedReason;
     readonly failureStreaks: EndpointFailureStreaks;
@@ -31,7 +30,6 @@ export interface EndpointState {
 export interface NetworkState<Endpoint extends EndpointState = EndpointState> {
     readonly chainId: number;
     readonly endpoints: readonly Endpoint[];
-    activeGroups: number;
     primaryRetrySelections: number;
     reservationClock: number;
     selectionCursor: number;
@@ -56,10 +54,8 @@ export interface EndpointReservation<Endpoint extends EndpointState = EndpointSt
 }
 
 export interface EndpointAvailabilityWaitOptions {
-    readonly deadlineMs: number;
     readonly runtime: Pick<RuntimeDependencies, "clearTimeout" | "monotonicNow" | "setTimeout">;
-    readonly signal?: AbortSignal;
-    readonly timeoutMs: number;
+    readonly signal: AbortSignal;
 }
 
 function selectRoundRobin<Endpoint extends EndpointState>(
@@ -125,8 +121,8 @@ export function reserveEndpoint<Endpoint extends EndpointState>(
 ): EndpointReservation<Endpoint> | null {
     const candidates = getEndpointCandidates(network, nowMs);
     const coldCandidates = mode === "retry" && primaryAttempt
-        ? candidates.filter(({ endpoint, requiresProbe }) =>
-            !requiresProbe && endpoint.latencyEwmaMs === null && endpoint.activeGroups === 0)
+        ? candidates.filter(({ endpoint }) =>
+            endpoint.latencyEwmaMs === null && endpoint.activeGroups === 0)
         : [];
     let selected = coldCandidates.length > 0
         ? selectRoundRobin(network, coldCandidates)
@@ -138,8 +134,8 @@ export function reserveEndpoint<Endpoint extends EndpointState>(
     if (mode === "retry" && primaryAttempt && coldCandidates.length === 0) {
         network.primaryRetrySelections += 1;
         if (network.primaryRetrySelections % 20 === 0) {
-            const alternatives = candidates.filter(({ endpoint, requiresProbe }) =>
-                !requiresProbe && endpoint !== selected?.endpoint && endpoint.activeGroups === 0);
+            const alternatives = candidates.filter(({ endpoint }) =>
+                endpoint !== selected?.endpoint && endpoint.activeGroups === 0);
             if (alternatives.length > 0) {
                 const oldest = Math.min(...alternatives.map(({ endpoint }) => endpoint.lastReserved));
                 selected = selectRoundRobin(
@@ -160,7 +156,6 @@ export function reserveEndpoint<Endpoint extends EndpointState>(
     network.reservationClock += 1;
     selected.endpoint.lastReserved = network.reservationClock;
     selected.endpoint.activeGroups += 1;
-    network.activeGroups += 1;
     return { ...selected, probeToken, version: selected.endpoint.version };
 }
 
@@ -192,9 +187,7 @@ export function waitForEndpointAvailability(
 
         const cleanup = (): void => {
             listeners.delete(evaluate);
-            if (abort !== null) {
-                signal?.removeEventListener("abort", abort);
-            }
+            signal.removeEventListener("abort", abort);
             if (timer !== null) {
                 options.runtime.clearTimeout(timer);
                 timer = null;
@@ -209,7 +202,7 @@ export function waitForEndpointAvailability(
                 reject(error);
             }
         };
-        const abort = signal === undefined ? null : (): void => {
+        const abort = (): void => {
             settle(signal.reason);
         };
         function evaluate(): void {
@@ -229,23 +222,17 @@ export function waitForEndpointAvailability(
                 return;
             }
 
-            const remainingMs = options.deadlineMs - nowMs;
-            if (remainingMs <= 0) {
-                settle(new OperationTimeoutError(network.chainId, options.timeoutMs));
-                return;
-            }
-
             const cooldownDeadlines = network.endpoints.flatMap(({ cooldownUntil, status }) =>
                 status === "cooling-down" && cooldownUntil !== null ? [cooldownUntil] : []);
-            const nearestCooldownMs = Math.min(...cooldownDeadlines, options.deadlineMs);
-            timer = options.runtime.setTimeout(evaluate, Math.max(0, nearestCooldownMs - nowMs));
+            if (cooldownDeadlines.length > 0) {
+                const nearestCooldownMs = Math.min(...cooldownDeadlines);
+                timer = options.runtime.setTimeout(evaluate, Math.max(0, nearestCooldownMs - nowMs));
+            }
         }
 
         listeners.add(evaluate);
-        if (abort !== null) {
-            signal?.addEventListener("abort", abort, { once: true });
-        }
-        if (signal?.aborted === true && abort !== null) {
+        signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) {
             abort();
         } else {
             evaluate();
@@ -255,7 +242,6 @@ export function waitForEndpointAvailability(
 
 function releaseEndpointReservation(network: NetworkState, reservation: EndpointReservation): void {
     reservation.endpoint.activeGroups -= 1;
-    network.activeGroups -= 1;
 
     if (reservation.probeToken !== null && reservation.endpoint.probeToken === reservation.probeToken) {
         reservation.endpoint.probeToken = null;

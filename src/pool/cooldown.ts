@@ -49,6 +49,15 @@ export function applyShortCooldown(
     return applyCooldown(endpoint, nowMs, runtime, shortPolicy, null);
 }
 
+export function applyShortCooldownWithMinimum(
+    endpoint: EndpointState,
+    nowMs: number,
+    runtime: Pick<RuntimeDependencies, "random">,
+    retryAfterMs: number | null,
+): number {
+    return applyCooldown(endpoint, nowMs, runtime, shortPolicy, retryAfterMs);
+}
+
 export function applyLongCooldown(
     endpoint: EndpointState,
     nowMs: number,
@@ -76,24 +85,13 @@ export function applyEndpointDataCooldown(
     return endpoint.cooldownUntil;
 }
 
-export function excludeEndpointForAuthorization(endpoint: EndpointState): void {
+export function excludeEndpoint(endpoint: EndpointState, reason: NonNullable<EndpointState["excludedReason"]>,): void {
     if (endpoint.status === "excluded") {
         return;
     }
 
     endpoint.cooldownUntil = null;
-    endpoint.excludedReason = "authorization";
-    endpoint.status = "excluded";
-    endpoint.version += 1;
-}
-
-export function excludeEndpointForChainIdMismatch(endpoint: EndpointState): void {
-    if (endpoint.status === "excluded") {
-        return;
-    }
-
-    endpoint.cooldownUntil = null;
-    endpoint.excludedReason = "chain-id-mismatch";
+    endpoint.excludedReason = reason;
     endpoint.status = "excluded";
     endpoint.version += 1;
 }
