@@ -1,6 +1,6 @@
 {
 	"name": "@drillcoder/ethers-rpc-pool",
-	"version": "0.0.0-development",
+	"version": "1.0.0",
 	"description": "A resilient TypeScript JSON-RPC endpoint pool for ethers v6 and Node.js",
 	"keywords": [
 		"ethereum",
