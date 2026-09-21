@@ -130,7 +130,10 @@ unknown. Inspect the chain or application state before deciding whether to submi
 ## Provider lifetime and listeners
 
 Each endpoint has one shared `JsonRpcProvider` owned by the manager. Completing a callback leaves that provider and
-its listeners active. Remove listeners that your code adds:
+its listeners active. A subscription created in a callback continues polling the same endpoint independently after
+the callback finishes. Those background requests use the transport request timeout and observability, but not the
+completed operation's group deadline, reservation, pool failover, or callback retry. Remove listeners that your code
+adds:
 
 ```ts
 await pool.executeOnce(1, async (provider) => {
@@ -146,6 +149,10 @@ await pool.executeOnce(1, async (provider) => {
     }
 });
 ```
+
+With `executeWithRetry()`, the entire callback may run again on another endpoint. Avoid registering the same listener
+more than once, or clean it up before a retry can occur. `off()` and `removeAllListeners()` stop a subscription after
+its last listener is removed; `pool.close()` stops background polling by destroying the endpoint providers.
 
 Calling `destroy()` or changing provider-wide settings affects every user of that endpoint provider. A provider saved
 and later used outside an execution callback sends requests directly to its fixed endpoint. Such calls use the

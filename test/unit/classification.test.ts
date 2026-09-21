@@ -107,7 +107,7 @@ describe("classifyRpcTransportError", () => {
         [-32_000, "rate limit exceeded", "rate-limit"],
         [-32_000, "too many requests", "rate-limit"],
         [402, "provider limit", "quota-limit"],
-        [-32_005, "quota exceeded", "quota-limit"],
+        [-32_005, "quota exceeded", "rate-limit"],
         [-32_000, "credits exhausted", "quota-limit"],
         [-32_000, "compute units exhausted", "quota-limit"],
         [-32_000, "monthly capacity limit exceeded", "quota-limit"],

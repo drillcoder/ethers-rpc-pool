@@ -334,6 +334,42 @@ describe("EndpointJsonRpcProvider", () => {
         provider.destroy();
     });
 
+    it.each([
+        [3, "execution reverted: unauthorized", "contract-execution"],
+        [-32_000, "execution reverted: rate limit exceeded", "contract-execution"],
+        [-32_000, "revert: quota exceeded", "contract-execution"],
+        [-32_602, "unauthorized", "invalid-params"],
+        [-32_601, "rate limit exceeded", "unsupported-method"],
+    ] as const)("prioritizes JSON-RPC structure for code %s", async (code, message, category) => {
+        const provider = new EndpointJsonRpcProvider(rpcUrl, 1, providerOptions(() => Promise.resolve(
+            Response.json({ error: { code, message }, id: 1, jsonrpc: "2.0" }),
+        )));
+
+        const error = await provider.send("test", []).catch((reason: unknown) => reason);
+
+        expect(getRpcFailure(error)).toEqual({ action: "none", category, httpStatus: 200 });
+        provider.destroy();
+    });
+
+    it.each([
+        [401, "authorization"],
+        [403, "authorization"],
+        [402, "quota-limit"],
+        [429, "rate-limit"],
+    ] as const)("keeps HTTP status %s ahead of a revert body", async (status, category) => {
+        const provider = new EndpointJsonRpcProvider(rpcUrl, 1, providerOptions(() => Promise.resolve(
+            Response.json(
+                { error: { code: 3, message: "execution reverted" }, id: 1, jsonrpc: "2.0" },
+                { status },
+            ),
+        )));
+
+        const error = await provider.send("eth_call", []).catch((reason: unknown) => reason);
+
+        expect(getRpcFailure(error)).toMatchObject({ category, httpStatus: status });
+        provider.destroy();
+    });
+
     it("retains HTTP metadata when the response body is not JSON", async () => {
         const request = vi.fn<HttpRequest>(() =>
             Promise.resolve(
@@ -452,6 +488,66 @@ describe("EndpointJsonRpcProvider", () => {
         provider.destroy();
     });
 
+    it.each([
+        ["bigint", [1n]],
+        ["throwing toJSON", [{ toJSON: () => { throw new Error("cannot encode"); } }]],
+    ])("keeps a %s serialization failure outside transport accounting", async (_name, params) => {
+        const request = vi.fn<HttpRequest>();
+        const observer = { onError: vi.fn(), onRequest: vi.fn(), onResponse: vi.fn() };
+        const provider = new EndpointJsonRpcProvider(rpcUrl, 1, {
+            ...providerOptions(request),
+            observer,
+        });
+
+        const error = await provider.send("test", params).catch((reason: unknown) => reason);
+
+        expect(error).toBeInstanceOf(Error);
+        expect(getRpcFailure(error)).toBeUndefined();
+        expect(request).not.toHaveBeenCalled();
+        expect(observer.onRequest).not.toHaveBeenCalled();
+        expect(observer.onResponse).not.toHaveBeenCalled();
+        expect(observer.onError).not.toHaveBeenCalled();
+        provider.destroy();
+    });
+
+    it("does not account for a cyclic payload as transport", async () => {
+        const cyclic: Record<string, unknown> = {};
+        cyclic.self = cyclic;
+        const request = vi.fn<HttpRequest>();
+        const observer = { onError: vi.fn(), onRequest: vi.fn(), onResponse: vi.fn() };
+        const provider = new EndpointJsonRpcProvider(rpcUrl, 1, {
+            ...providerOptions(request),
+            observer,
+        });
+
+        const error = await provider.send("test", [cyclic]).catch((reason: unknown) => reason);
+
+        expect(error).toBeInstanceOf(TypeError);
+        expect(getRpcFailure(error)).toBeUndefined();
+        expect(request).not.toHaveBeenCalled();
+        expect(observer.onRequest).not.toHaveBeenCalled();
+        expect(observer.onError).not.toHaveBeenCalled();
+        provider.destroy();
+    });
+
+    it("does not send when serialization consumes the remaining deadline", async () => {
+        let now = 0;
+        const request = vi.fn<HttpRequest>();
+        const observer = { onError: vi.fn(), onRequest: vi.fn(), onResponse: vi.fn() };
+        const provider = new EndpointJsonRpcProvider(rpcUrl, 1, {
+            ...providerOptions(request),
+            observer,
+            runtime: { monotonicNow: () => now },
+        });
+        const params = [{ toJSON: () => { now = 101; return "encoded"; } }];
+
+        await expect(provider.runWithDeadline(100, async () => await provider.send("test", params)))
+            .rejects.toEqual(new RpcRequestTimeoutError(0));
+        expect(request).not.toHaveBeenCalled();
+        expect(observer.onRequest).not.toHaveBeenCalled();
+        provider.destroy();
+    });
+
     it("aborts a pending request when its timeout expires", async () => {
         let fireTimeout = (): void => undefined;
         const timerHandle = {} as TimerHandle;
@@ -525,5 +621,96 @@ describe("EndpointJsonRpcProvider", () => {
         await expect(pending).rejects.toThrow("context is no longer active");
         expect(request).toHaveBeenCalledOnce();
         provider.destroy();
+    });
+
+    it("runs block subscriber lifecycle outside a completed attempt context", async () => {
+        vi.useFakeTimers();
+        let blockNumber = 0;
+        const request = vi.fn<HttpRequest>((_input, init) => {
+            const payload = JSON.parse(init.body as string) as { id: number; method: string };
+            blockNumber += 1;
+            return Promise.resolve(jsonResponse(`0x${blockNumber.toString(16)}`, payload.id));
+        });
+        const provider = new EndpointJsonRpcProvider(rpcUrl, 1, providerOptions(request));
+        provider.pollingInterval = 10;
+        const listener = vi.fn();
+        const subscriber = provider._getSubscriber({ tag: "block", type: "block" });
+        expect(subscriber.pollingInterval).toBe(10);
+        subscriber.pollingInterval = 25;
+        expect(subscriber.pollingInterval).toBe(25);
+
+        try {
+            await provider.runWithDeadline(1_000, async () => await provider.on("block", listener));
+            await vi.advanceTimersByTimeAsync(10);
+            expect(request.mock.calls.length).toBeGreaterThanOrEqual(2);
+            expect(listener.mock.calls[0]?.[0]).toBe(2);
+
+            await provider.runWithDeadline(1_000, () => {
+                provider.pause();
+                provider.resume();
+                return Promise.resolve();
+            });
+            const requestsBeforeResumePoll = request.mock.calls.length;
+            await vi.advanceTimersByTimeAsync(10);
+            expect(request.mock.calls.length).toBeGreaterThan(requestsBeforeResumePoll);
+
+            await provider.off("block", listener);
+            await vi.advanceTimersByTimeAsync(10);
+            const requestsAfterOff = request.mock.calls.length;
+            await vi.advanceTimersByTimeAsync(50);
+            expect(request).toHaveBeenCalledTimes(requestsAfterOff);
+        } finally {
+            provider.destroy();
+            vi.useRealTimers();
+        }
+    });
+
+    it("delivers filter events after the registering attempt completes", async () => {
+        vi.useFakeTimers();
+        let blockNumber = 0;
+        let filterPolls = 0;
+        const request = vi.fn<HttpRequest>((_input, init) => {
+            const payload = JSON.parse(init.body as string) as { id: number; method: string };
+            if (payload.method === "eth_newFilter") {
+                return Promise.resolve(Response.json({
+                    error: { code: -32_601, message: "the method eth_newFilter does not exist" },
+                    id: payload.id,
+                    jsonrpc: "2.0",
+                }));
+            }
+            if (payload.method === "eth_getLogs") {
+                filterPolls += 1;
+                const result = filterPolls === 1 ? [] : [{
+                    address: "0x0000000000000000000000000000000000000001",
+                    blockHash: `0x${"11".repeat(32)}`,
+                    blockNumber: "0x2",
+                    data: "0x",
+                    logIndex: "0x0",
+                    removed: false,
+                    topics: [],
+                    transactionHash: `0x${"22".repeat(32)}`,
+                    transactionIndex: "0x0",
+                }];
+                return Promise.resolve(jsonResponse(result, payload.id));
+            }
+            blockNumber += 1;
+            return Promise.resolve(jsonResponse(`0x${blockNumber.toString(16)}`, payload.id));
+        });
+        const provider = new EndpointJsonRpcProvider(rpcUrl, 1, providerOptions(request));
+        provider.pollingInterval = 10;
+        const listener = vi.fn();
+        const filter = { address: "0x0000000000000000000000000000000000000001" };
+
+        try {
+            await provider.runWithDeadline(1_000, async () => await provider.on(filter, listener));
+            await vi.advanceTimersByTimeAsync(20);
+            expect(listener).toHaveBeenCalled();
+            expect(listener.mock.calls[0]?.[0]).toMatchObject({ blockNumber: 2 });
+            expect(filterPolls).toBeGreaterThanOrEqual(2);
+            await provider.off(filter, listener);
+        } finally {
+            provider.destroy();
+            vi.useRealTimers();
+        }
     });
 });

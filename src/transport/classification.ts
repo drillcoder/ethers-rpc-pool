@@ -92,24 +92,6 @@ function classifyJsonRpcError(
 ): RpcErrorClassification {
     const message = error.message ?? "";
 
-    if (authorizationCodes.has(error.code) || authorizationPattern.test(message)) {
-        return exclude("authorization", httpStatus);
-    }
-
-    if (
-        jsonRpcLimitSignatures.quotaLimitCodes.includes(error.code) ||
-        jsonRpcLimitSignatures.quotaLimitPattern.test(message)
-    ) {
-        return cooldown("quota-limit", httpStatus, retryAfterMs);
-    }
-
-    if (
-        jsonRpcLimitSignatures.rateLimitCodes.includes(error.code) ||
-        jsonRpcLimitSignatures.rateLimitPattern.test(message)
-    ) {
-        return cooldown("rate-limit", httpStatus, retryAfterMs);
-    }
-
     switch (error.code) {
         case -32_602:
             return passThrough("invalid-params", httpStatus);
@@ -118,12 +100,32 @@ function classifyJsonRpcError(
         case 3:
             return passThrough("contract-execution", httpStatus);
         default:
-            if (contractExecutionPattern.test(message)) {
-                return passThrough("contract-execution", httpStatus);
-            }
-
-            return passThrough("unknown", httpStatus);
+            break;
     }
+
+    if (authorizationCodes.has(error.code)) {
+        return exclude("authorization", httpStatus);
+    }
+    if (jsonRpcLimitSignatures.quotaLimitCodes.includes(error.code)) {
+        return cooldown("quota-limit", httpStatus, retryAfterMs);
+    }
+    if (jsonRpcLimitSignatures.rateLimitCodes.includes(error.code)) {
+        return cooldown("rate-limit", httpStatus, retryAfterMs);
+    }
+    if (contractExecutionPattern.test(message)) {
+        return passThrough("contract-execution", httpStatus);
+    }
+    if (authorizationPattern.test(message)) {
+        return exclude("authorization", httpStatus);
+    }
+    if (jsonRpcLimitSignatures.quotaLimitPattern.test(message)) {
+        return cooldown("quota-limit", httpStatus, retryAfterMs);
+    }
+    if (jsonRpcLimitSignatures.rateLimitPattern.test(message)) {
+        return cooldown("rate-limit", httpStatus, retryAfterMs);
+    }
+
+    return passThrough("unknown", httpStatus);
 }
 
 function classifyHttpResponse(error: RpcTransportResponseError, nowMs: number): RpcErrorClassification {

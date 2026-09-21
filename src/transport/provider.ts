@@ -6,6 +6,8 @@ import type {
     JsonRpcPayload,
     JsonRpcResult,
     Networkish,
+    Subscriber,
+    Subscription,
 } from "ethers";
 
 import { EndpointReservationUnavailableError } from "../pool/attempt.js";
@@ -100,6 +102,7 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
     readonly #request: HttpRequest;
     readonly #requestTimeoutMs: number;
     readonly #runtime: RuntimeDependencies;
+    readonly #subscriberWrappers = new WeakMap<Subscriber, Subscriber>();
     readonly #url: string;
     #nextId = 1;
 
@@ -162,6 +165,61 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
         );
     }
 
+    public override _getSubscriber(subscription: Subscription): Subscriber {
+        return this.#wrapSubscriber(super._getSubscriber(subscription));
+    }
+
+    public override _recoverSubscriber(oldSubscriber: Subscriber, newSubscriber: Subscriber): void {
+        super._recoverSubscriber(
+            this.#wrapSubscriber(oldSubscriber),
+            this.#wrapSubscriber(newSubscriber),
+        );
+    }
+
+    #wrapSubscriber(subscriber: Subscriber): Subscriber {
+        const existing = this.#subscriberWrappers.get(subscriber);
+        if (existing !== undefined) {
+            return existing;
+        }
+        const runOutsideAttempt = (operation: () => void): void => {
+            this.#context.exit(operation);
+        };
+        const wrapper: Subscriber = {
+            pause: (dropWhilePaused?: boolean) => {
+                runOutsideAttempt(() => {
+                    subscriber.pause(dropWhilePaused);
+                });
+            },
+            resume: () => {
+                runOutsideAttempt(() => {
+                    subscriber.resume();
+                });
+            },
+            start: () => {
+                runOutsideAttempt(() => {
+                    subscriber.start();
+                });
+            },
+            stop: () => {
+                runOutsideAttempt(() => {
+                    subscriber.stop();
+                });
+            },
+        };
+        if (subscriber.pollingInterval !== undefined) {
+            Object.defineProperty(wrapper, "pollingInterval", {
+                configurable: true,
+                enumerable: true,
+                get: () => subscriber.pollingInterval,
+                set: (value: number) => {
+                    subscriber.pollingInterval = value;
+                },
+            });
+        }
+        this.#subscriberWrappers.set(subscriber, wrapper);
+        return wrapper;
+    }
+
     async #sendOne(payload: JsonRpcPayload): Promise<JsonRpcResult> {
         if (this.destroyed) {
             throw makeError("provider destroyed", "UNSUPPORTED_OPERATION", { operation: "send" });
@@ -174,6 +232,7 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
                 throw new EndpointReservationUnavailableError();
             }
         }
+        const serializedBody = JSON.stringify(payload);
         const deadlineMs = context?.deadlineMs;
         const remainingMs =
             deadlineMs === undefined
@@ -187,7 +246,7 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
         const startedMonotonic = this.#runtime.monotonicNow();
         this.#observer?.onRequest(payload.method, startedAt);
         try {
-            const transportResult = await this.#requestPayload(payload, context, remainingMs);
+            const transportResult = await this.#requestPayload(payload, serializedBody, context, remainingMs);
             const { result } = transportResult;
             const finishedAt = this.#runtime.epochNow();
             if ("error" in result) {
@@ -239,6 +298,7 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
 
     async #requestPayload(
         payload: JsonRpcPayload,
+        serializedBody: string,
         context: RequestContext | undefined,
         remainingMs: number,
     ): Promise<TransportResult> {
@@ -256,7 +316,7 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
 
         try {
             const response = await this.#request(this.#url, {
-                body: JSON.stringify(payload),
+                body: serializedBody,
                 headers: {
                     "content-type": "application/json",
                 },

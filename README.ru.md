@@ -130,7 +130,10 @@ console.log(transaction.hash);
 ## Время жизни provider и listeners
 
 Каждый endpoint имеет один общий `JsonRpcProvider`, которым владеет менеджер. Завершение callback сохраняет provider
-и его listeners активными. Код, добавивший listener, должен сам его удалить:
+и его listeners активными. Подписка, созданная в callback, после его завершения самостоятельно продолжает опрашивать
+тот же endpoint. Эти фоновые запросы используют transport request timeout и observability, но не групповой deadline,
+резервирование, failover пула или retry callback завершённой операции. Код, добавивший listener, должен сам его
+удалить:
 
 ```ts
 await pool.executeOnce(1, async (provider) => {
@@ -146,6 +149,10 @@ await pool.executeOnce(1, async (provider) => {
     }
 });
 ```
+
+При `executeWithRetry()` весь callback может быть повторно запущен на другом endpoint. Не регистрируйте один listener
+повторно либо очищайте его до возможного retry. `off()` и `removeAllListeners()` останавливают подписку после удаления
+её последнего listener; `pool.close()` прекращает фоновые опросы, уничтожая providers endpoint.
 
 Вызов `destroy()` или изменение общих настроек provider влияет на всех пользователей provider этого endpoint.
 Сохранённый provider при позднем вызове вне execution callback отправляет запрос прямо на закреплённый endpoint. Такой

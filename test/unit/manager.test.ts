@@ -1349,6 +1349,89 @@ describe("RpcPoolManager operation entry points", () => {
         expect(manager.getSnapshot().networks[0]?.endpoints[0]?.status).toBe("cooling-down");
     });
 
+    it.each(["retry", "once"] as const)(
+        "passes a revert-like provider error through unchanged in %s mode",
+        async (mode) => {
+            vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
+                const payload = JSON.parse(init?.body as string) as { id: number; method: string };
+                if (payload.method === "eth_chainId") {
+                    return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x1" }));
+                }
+                return Promise.resolve(Response.json({
+                    error: {
+                        code: -32_000,
+                        data: "0xdeadbeef",
+                        message: "execution reverted: unauthorized and rate limit exceeded",
+                    },
+                    id: payload.id,
+                    jsonrpc: "2.0",
+                }));
+            }));
+            const manager = new RpcPoolManager({
+                ...config,
+                networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
+            });
+            let providerError: unknown;
+            const callback = vi.fn<(client: JsonRpcProvider) => Promise<unknown>>(async (client) => {
+                try {
+                    return await (client.send("test", []) as Promise<unknown>);
+                } catch (error: unknown) {
+                    providerError = error;
+                    throw error;
+                }
+            });
+
+            const operation = mode === "retry"
+                ? manager.executeWithRetry(1, callback)
+                : manager.executeOnce(1, callback);
+            const result: unknown = await operation.catch((error: unknown) => error);
+
+            expect(result).toBe(providerError);
+            expect(result).toMatchObject({ code: "UNKNOWN_ERROR", error: { code: -32_000, data: "0xdeadbeef" } });
+            expect(callback).toHaveBeenCalledOnce();
+            expect(manager.getSnapshot().errorsByCategory).toEqual({ "contract-execution": 1 });
+            expect(manager.getSnapshot().networks[0]?.endpoints[0]).toMatchObject({
+                excludedReason: null,
+                status: "available",
+            });
+            await manager.close();
+        },
+    );
+
+    it.each(["retry", "once"] as const)(
+        "keeps serialization failures local in %s mode",
+        async (mode) => {
+            const methods = new Map<string, string[]>();
+            vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
+                const endpoint = requestUrl(input);
+                const payload = JSON.parse(init?.body as string) as { id: number; method: string };
+                methods.set(endpoint, [...(methods.get(endpoint) ?? []), payload.method]);
+                return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0x1" }));
+            }));
+            const manager = new RpcPoolManager({
+                ...config,
+                networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
+            });
+            const failure = new Error("toJSON failed");
+            const callback = vi.fn<(client: JsonRpcProvider) => Promise<unknown>>(async (client) =>
+                await (client.send("test", [{
+                    toJSON: () => { throw failure; },
+                }]) as Promise<unknown>));
+
+            const operation = mode === "retry"
+                ? manager.executeWithRetry(1, callback)
+                : manager.executeOnce(1, callback);
+
+            await expect(operation).rejects.toBe(failure);
+            expect(callback).toHaveBeenCalledOnce();
+            expect(methods.get("https://first.example/")).toEqual(["eth_chainId"]);
+            expect(methods.has("https://second.example/")).toBe(false);
+            expect(manager.getSnapshot()).toMatchObject({ errorsByCategory: {}, totalRequests: 1 });
+            expect(manager.getSnapshot().networks[0]?.endpoints[0]?.status).toBe("available");
+            await manager.close();
+        },
+    );
+
     it("switches endpoints after chain verification failure without starting the single callback twice", async () => {
         const methods = new Map<string, string[]>();
         vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
