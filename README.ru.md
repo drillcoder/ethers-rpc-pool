@@ -194,7 +194,7 @@ latencyEwmaMs × (activeGroups + 1)
 const controller = new AbortController();
 const operation = pool.executeWithRetry(
     1,
-    async (provider) => await provider.waitForBlock(20_000),
+    async (provider) => await provider.getBlockNumber(),
     { signal: controller.signal },
 );
 

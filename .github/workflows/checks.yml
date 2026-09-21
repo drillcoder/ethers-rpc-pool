@@ -31,6 +31,8 @@ jobs:
     permissions:
       contents: write
       id-token: write
+      issues: write
+      pull-requests: write
     steps:
       - name: Check out full history
         uses: actions/checkout@v7
