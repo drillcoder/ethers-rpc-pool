@@ -1,4 +1,4 @@
-name: Checks
+name: CI
 
 on:
   pull_request:
@@ -21,7 +21,13 @@ jobs:
         run: docker build --tag ethers-rpc-pool-quality .
 
       - name: Run hermetic quality gate
-        run: docker run --rm --network none ethers-rpc-pool-quality
+        run: docker run --rm --network none --volume "${{ github.workspace }}/coverage:/workspace/coverage" ethers-rpc-pool-quality
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          files: ./coverage/lcov.info
+          fail_ci_if_error: true
 
   release:
     name: Release

@@ -1,5 +1,16 @@
 # ethers-rpc-pool
 
+<p align="center">
+  <a href="https://www.npmjs.com/package/@drillcoder/ethers-rpc-pool"><img alt="npm" src="https://img.shields.io/npm/v/%40drillcoder%2Fethers-rpc-pool?style=flat-square"></a>
+  <a href="https://www.npmjs.com/package/@drillcoder/ethers-rpc-pool"><img alt="npm downloads" src="https://img.shields.io/npm/dm/%40drillcoder%2Fethers-rpc-pool?style=flat-square"></a>
+  <a href="./LICENSE"><img alt="license" src="https://img.shields.io/npm/l/%40drillcoder%2Fethers-rpc-pool?style=flat-square"></a>
+  <a href="https://github.com/drillcoder/ethers-rpc-pool/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/drillcoder/ethers-rpc-pool/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+  <a href="https://codecov.io/gh/drillcoder/ethers-rpc-pool"><img alt="test coverage" src="https://codecov.io/gh/drillcoder/ethers-rpc-pool/branch/main/graph/badge.svg"></a>
+  <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-6.x-3178c6?style=flat-square">
+  <img alt="ethers" src="https://img.shields.io/badge/ethers-v6-2535a0?style=flat-square">
+  <img alt="Node.js" src="https://img.shields.io/badge/Node.js-22%2B-339933?style=flat-square">
+</p>
+
 [🇬🇧 English](README.md) | 🇷🇺 Русский
 
 Отказоустойчивый пул JSON-RPC endpoint для ethers v6 и Node.js. Он выбирает endpoint для каждой операции, учитывает
