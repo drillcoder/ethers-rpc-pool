@@ -21,7 +21,11 @@ jobs:
         run: docker build --tag ethers-rpc-pool-quality .
 
       - name: Run hermetic quality gate
-        run: docker run --rm --network none --volume "${{ github.workspace }}/coverage:/workspace/coverage" ethers-rpc-pool-quality
+        run: >-
+          docker run --rm --network none
+          --volume "${{ github.workspace }}:/workspace"
+          --volume /workspace/node_modules
+          ethers-rpc-pool-quality
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7
