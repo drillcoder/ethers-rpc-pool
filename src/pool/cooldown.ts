@@ -77,7 +77,7 @@ export function applyEndpointDataCooldown(
     return endpoint.cooldownUntil;
 }
 
-export function excludeEndpoint(endpoint: EndpointState, reason: NonNullable<EndpointState["excludedReason"]>,): void {
+export function excludeEndpoint(endpoint: EndpointState, reason: NonNullable<EndpointState["excludedReason"]>): void {
     if (endpoint.status === "excluded") {
         return;
     }

@@ -501,7 +501,7 @@ export class RpcPoolManager {
         });
     }
 
-    async #waitForEndpoint(network: NetworkState<ManagedEndpoint>, options: OperationOptions,): Promise<void> {
+    async #waitForEndpoint(network: NetworkState<ManagedEndpoint>, options: OperationOptions): Promise<void> {
         await waitForEndpointAvailability(network, {
             runtime: this.#runtime,
             signal: options.signal,

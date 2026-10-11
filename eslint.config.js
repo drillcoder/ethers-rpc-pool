@@ -32,6 +32,12 @@ export default tseslint.config(
         files: typescriptFiles,
     })),
     {
+        rules: {
+            "comma-dangle": ["error", "always-multiline"],
+            "function-call-argument-newline": ["error", "consistent"],
+        },
+    },
+    {
         files: typescriptFiles,
         languageOptions: {
             parserOptions: {
