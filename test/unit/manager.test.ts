@@ -10,7 +10,7 @@ import {
     RpcPoolManager,
     UnknownNetworkError,
 } from "../../src/index.js";
-import { EndpointJsonRpcProvider } from "../../src/transport/provider.js";
+import { EndpointJsonRpcProvider, getRpcErrorResponse } from "../../src/transport/provider.js";
 import type {
     RpcExecutionOptions,
     RpcPoolLoggerEvent,
@@ -1647,5 +1647,505 @@ describe("RpcPoolManager operation entry points", () => {
         await expect(operation).rejects.toThrow("Reserved RPC endpoint is no longer available");
         expect(callback).toHaveBeenCalledOnce();
         expect(methods).toEqual(["eth_chainId", "debug_first"]);
+    });
+});
+
+const broadcastWallet = new Wallet("0x" + "11".repeat(32));
+const broadcastTx = await broadcastWallet.signTransaction({
+    chainId: 1,
+    type: 2,
+    nonce: 0,
+    gasLimit: 21_000,
+    maxFeePerGas: 10,
+    maxPriorityFeePerGas: 1,
+});
+const broadcastHash = keccak256(broadcastTx);
+
+function broadcastManager(count = 3): RpcPoolManager {
+    return new RpcPoolManager({
+        ...config,
+        networks: [{
+            chainId: 1,
+            rpcUrls: Array.from({ length: count }, (_, index) => `https://rpc${String(index)}.example`),
+        }],
+    });
+}
+
+interface BroadcastPayload {
+    id: number;
+    method: string;
+    params: string[];
+}
+
+function broadcastPayload(init?: RequestInit): BroadcastPayload {
+    return JSON.parse(init?.body as string) as BroadcastPayload;
+}
+
+function broadcastResponse(payload: BroadcastPayload, result: unknown = broadcastHash): Response {
+    return Response.json({
+        id: payload.id, jsonrpc: "2.0", result: payload.method === "eth_chainId" ? "0x1" : result,
+    });
+}
+
+describe("RpcPoolManager broadcastTransaction", () => {
+    afterEach(() => {
+        vi.restoreAllMocks();
+        vi.unstubAllGlobals();
+        vi.useRealTimers();
+    });
+    it.each([undefined, 1, 10])("sends original bytes once per endpoint with maxCount %s", async (maxCount) => {
+        const request = vi.fn((_input: string, init?: RequestInit) =>
+            Promise.resolve(broadcastResponse(broadcastPayload(init), broadcastHash.toUpperCase())));
+        vi.stubGlobal("fetch", request);
+        const manager = broadcastManager(4);
+        expect(await manager.broadcastTransaction(1, broadcastTx, maxCount === undefined ? {} : { maxCount }))
+            .toBe(broadcastHash);
+        const sends = request.mock.calls.filter(([, init]) =>
+            broadcastPayload(init).method === "eth_sendRawTransaction");
+        expect(sends).toHaveLength(Math.min(maxCount ?? 3, 4));
+        expect(new Set(sends.map(([url]) => url)).size).toBe(sends.length);
+        expect(sends.map(([, init]) => broadcastPayload(init).params)).toEqual(sends.map(() => [broadcastTx]));
+        expect(manager.getSnapshot().totalActiveGroups).toBe(0);
+        await manager.close();
+    });
+
+    it.each([0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])("rejects count %s", async (maxCount) => {
+        const request = vi.fn();
+        vi.stubGlobal("fetch", request);
+        const manager = broadcastManager();
+        await expect(manager.broadcastTransaction(1, broadcastTx, { maxCount })).rejects.toBeInstanceOf(RangeError);
+        expect(request).not.toHaveBeenCalled();
+        expect(manager.getSnapshot().totalActiveGroups).toBe(0);
+        await manager.close();
+    });
+
+    it("rejects bad timeout, malformed, unsigned, wrong-chain and unprotected transactions without HTTP", async () => {
+        const request = vi.fn();
+        vi.stubGlobal("fetch", request);
+        const manager = broadcastManager();
+        const { Transaction } = await import("ethers");
+        const unsigned = Transaction.from({ chainId: 1, type: 2, gasLimit: 21000 }).unsignedSerialized;
+        const wrong = await broadcastWallet.signTransaction({ chainId: 10, gasLimit: 21000 });
+        const legacy = await broadcastWallet.signTransaction({ type: 0, chainId: 0, gasLimit: 21000, gasPrice: 1 });
+        for (const tx of ["0xno", unsigned, wrong, legacy])
+            await expect(manager.broadcastTransaction(1, tx)).rejects.toBeInstanceOf(Error);
+        for (const timeoutMs of [0, -1, 0.5, Infinity])
+            await expect(manager.broadcastTransaction(1, broadcastTx, { timeoutMs }))
+                .rejects.toBeInstanceOf(RangeError);
+        expect(request).not.toHaveBeenCalled();
+        await manager.close();
+    });
+
+    it("launches all branches before an answer and returns early while siblings continue", async () => {
+        vi.useFakeTimers();
+        const pending: {
+            payload: BroadcastPayload;
+            response: ReturnType<typeof deferred<Response>>;
+        }[] = [];
+        vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) => {
+            const payload = broadcastPayload(init);
+            if (payload.method === "eth_chainId")
+                return Promise.resolve(broadcastResponse(payload));
+            const response = deferred<Response>();
+            pending.push({ payload, response });
+            return response.promise;
+        }));
+        const manager = broadcastManager();
+        const operation = manager.broadcastTransaction(1, broadcastTx);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(pending).toHaveLength(3);
+        pending[0]?.response.resolve(broadcastResponse(pending[0].payload));
+        await expect(operation).resolves.toBe(broadcastHash);
+        expect(manager.getSnapshot().totalActiveGroups).toBe(2);
+        for (const branch of pending.slice(1))
+            branch.response.resolve(broadcastResponse(branch.payload));
+        await vi.advanceTimersByTimeAsync(0);
+        expect(manager.getSnapshot().totalActiveGroups).toBe(0);
+        expect(vi.getTimerCount()).toBe(0);
+        await manager.close();
+    });
+
+    it("never replaces or repeats a failed verifier or send branch", async () => {
+        const request = vi.fn((url: string, init?: RequestInit) => {
+            const payload = broadcastPayload(init);
+            if (url.includes("rpc0"))
+                return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0xa" }));
+            if (payload.method === "eth_sendRawTransaction")
+                return Promise.resolve(Response.json({
+                    id: payload.id, jsonrpc: "2.0", error: { code: -32000, message: "nonce too low" },
+                }));
+            return Promise.resolve(broadcastResponse(payload));
+        });
+        vi.stubGlobal("fetch", request);
+        const manager = broadcastManager(3);
+        const { RpcBroadcastError } = await import("../../src/index.js");
+        const error: unknown = await manager.broadcastTransaction(1, broadcastTx, { maxCount: 2 })
+            .catch((failure: unknown) => failure);
+        expect(error).toBeInstanceOf(RpcBroadcastError);
+        if (!(error instanceof RpcBroadcastError))
+            throw new Error("Expected broadcast error");
+        expect(error.chainId).toBe(1);
+        expect(error.hash).toBe(broadcastHash);
+        expect(error.failures.map(({ endpointNumber, outcome }) => [endpointNumber, outcome]))
+            .toEqual([[1, "not-sent"], [2, "rejected"]]);
+        expect(error.failures[1]?.error).toBeInstanceOf(Error);
+        expect(request.mock.calls.map(([url, init]) => [url, broadcastPayload(init).method])).toEqual([
+            ["https://rpc0.example/", "eth_chainId"],
+            ["https://rpc1.example/", "eth_chainId"],
+            ["https://rpc1.example/", "eth_sendRawTransaction"],
+        ]);
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]?.excludedReason).toBe("chain-id-mismatch");
+        await manager.close();
+    });
+
+    it.each([
+        [200, -32000, "  Already Known  ", true, "available"],
+        [200, -32000, "nonce too low", false, "available"],
+        [200, -32602, "already known", false, "available"],
+        [200, -32601, "already known", false, "available"],
+        [200, 3, "already known", false, "available"],
+        [200, 401, "already known", false, "excluded"],
+        [200, 429, "already known", false, "cooling-down"],
+        [200, 402, "already known", false, "cooling-down"],
+        [401, -32000, "already known", false, "excluded"],
+        [429, -32000, "already known", false, "cooling-down"],
+        [503, -32000, "already known", false, "cooling-down"],
+        [200, -32000, "transaction already known", false, "available"],
+    ] as const)("recognizes already known (%s, %s, %s)", async (status, code, message, success, endpointStatus) => {
+        vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) => {
+            const payload = broadcastPayload(init);
+            return Promise.resolve(payload.method === "eth_chainId"
+                ? broadcastResponse(payload)
+                : Response.json({ id: payload.id, jsonrpc: "2.0", error: { code, message } }, { status }));
+        }));
+        const manager = broadcastManager(1);
+        const operation = manager.broadcastTransaction(1, broadcastTx);
+        if (success)
+            await expect(operation).resolves.toBe(broadcastHash);
+        else
+            await expect(operation).rejects.toMatchObject({ name: "RpcBroadcastError" });
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]?.status).toBe(endpointStatus);
+        expect(manager.getSnapshot().totalRequests).toBe(2);
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]?.errorCount).toBe(1);
+        await manager.close();
+    });
+
+    it.each(["invalid", "0x" + "ff".repeat(32), null])("treats hash %s as uncertain delivery", async (result) => {
+        vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) =>
+            Promise.resolve(broadcastResponse(broadcastPayload(init), result))));
+        const manager = broadcastManager(1);
+        await expect(manager.broadcastTransaction(1, broadcastTx)).rejects.toMatchObject({
+            failures: [{
+                    outcome: "unknown", error: expect.any(RpcEndpointDataError) as unknown,
+                }],
+        });
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]?.status).toBe("cooling-down");
+        expect(manager.getSnapshot().errorsByCategory["endpoint-data"]).toBe(1);
+        await manager.close();
+    });
+
+    it("does not accept a similar local exception and preserves it as unknown delivery", async () => {
+        const error = new Error("already known");
+        expect(getRpcErrorResponse("already known")).toBeUndefined();
+        expect(getRpcErrorResponse(null)).toBeUndefined();
+        vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) =>
+            broadcastPayload(init).method === "eth_chainId"
+                ? Promise.resolve(broadcastResponse(broadcastPayload(init)))
+                : Promise.reject(error)));
+        const manager = broadcastManager(1);
+        await expect(manager.broadcastTransaction(1, broadcastTx))
+            .rejects.toMatchObject({ failures: [{ error, outcome: "unknown" }] });
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]?.status).toBe("cooling-down");
+        await manager.close();
+    });
+});
+describe("broadcast deadlines and endpoint recovery", () => {
+    afterEach(() => {
+        vi.restoreAllMocks();
+        vi.unstubAllGlobals();
+        vi.useRealTimers();
+    });
+    it("recovers an actual probe on already known without changing RPC error counters", async () => {
+        vi.useFakeTimers();
+        vi.spyOn(Math, "random").mockReturnValue(0);
+        vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) => {
+            const payload = broadcastPayload(init);
+            return Promise.resolve(payload.method === "eth_chainId" ? broadcastResponse(payload) : Response.json({
+                id: payload.id, jsonrpc: "2.0", error: { code: -32000, message: "already known" },
+            }));
+        }));
+        const pool = broadcastManager(1);
+        await expect(pool.executeOnce(1, () => Promise.reject(new RpcEndpointDataError())))
+            .rejects.toBeInstanceOf(RpcEndpointDataError);
+        await vi.advanceTimersByTimeAsync(5000);
+        await expect(pool.broadcastTransaction(1, broadcastTx)).resolves.toBe(broadcastHash);
+        expect(pool.getSnapshot().networks[0]?.endpoints[0]?.status).toBe("available");
+        expect(pool.getSnapshot().errorsByCategory).toEqual({ "endpoint-data": 1, unknown: 1 });
+        expect(vi.getTimerCount()).toBe(0);
+        await pool.close();
+    });
+
+    it("treats request timeout as unknown delivery, cooling only the failed branch", async () => {
+        vi.useFakeTimers();
+        vi.stubGlobal("fetch", vi.fn((url: string, init?: RequestInit) => {
+            const payload = broadcastPayload(init);
+            if (payload.method === "eth_chainId" || url.includes("rpc1"))
+                return Promise.resolve(broadcastResponse(payload));
+            return new Promise<Response>((_resolve, reject) => {
+                init?.signal?.addEventListener("abort", () => {
+                    reject(init.signal?.reason as Error);
+                }, { once: true });
+            });
+        }));
+        const manager = broadcastManager(2);
+        await expect(manager.broadcastTransaction(1, broadcastTx)).resolves.toBe(broadcastHash);
+        expect(manager.getSnapshot().totalActiveGroups).toBe(1);
+        await vi.advanceTimersByTimeAsync(50);
+        expect(manager.getSnapshot().networks[0]?.endpoints.map(({ status }) => status))
+            .toEqual(["cooling-down", "available"]);
+        expect(manager.getSnapshot().errorsByCategory).toEqual({ timeout: 1 });
+        expect(manager.getSnapshot().totalActiveGroups).toBe(0);
+        expect(vi.getTimerCount()).toBe(0);
+        await manager.close();
+    });
+
+    it("preserves unknown network and no candidates errors", async () => {
+        vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) => {
+            const payload = broadcastPayload(init);
+            return Promise.resolve(Response.json({ id: payload.id, jsonrpc: "2.0", result: "0xa" }));
+        }));
+        const manager = broadcastManager(1);
+        await expect(manager.broadcastTransaction(10, broadcastTx)).rejects.toBeInstanceOf(UnknownNetworkError);
+        await expect(manager.broadcastTransaction(1, broadcastTx)).rejects.toMatchObject({
+            name: "RpcBroadcastError", failures: [{ outcome: "not-sent" }],
+        });
+        await expect(manager.broadcastTransaction(1, broadcastTx)).rejects.toBeInstanceOf(NoUsableRpcEndpointError);
+        await manager.close();
+    });
+
+    it.each(["signal", "close", "deadline"] as const)("cancels remaining sends with %s after success", async (kind) => {
+        vi.useFakeTimers();
+        let aborted = false;
+        vi.stubGlobal("fetch", vi.fn((url: string, init?: RequestInit) => {
+            const payload = broadcastPayload(init);
+            if (payload.method === "eth_chainId" || url.includes("rpc0"))
+                return Promise.resolve(broadcastResponse(payload));
+            return new Promise<Response>((_resolve, reject) => {
+                init?.signal?.addEventListener("abort", () => {
+                    aborted = true;
+                    reject(init.signal?.reason as Error);
+                }, { once: true });
+            });
+        }));
+        const controller = new AbortController();
+        const manager = new RpcPoolManager({
+            ...config, requestTimeoutMs: 200, networks: [{
+                    chainId: 1, rpcUrls: ["https://rpc0.example", "https://rpc1.example"],
+                }],
+        });
+        await expect(manager.broadcastTransaction(1, broadcastTx, { signal: controller.signal }))
+            .resolves.toBe(broadcastHash);
+        expect(manager.getSnapshot().totalActiveGroups).toBe(1);
+        if (kind === "signal")
+            controller.abort(new Error("user cancelled"));
+        if (kind === "close")
+            await manager.close();
+        await vi.advanceTimersByTimeAsync(kind === "deadline" ? 100 : 0);
+        expect(aborted).toBe(true);
+        expect(manager.getSnapshot().totalActiveGroups).toBe(0);
+        expect(manager.getSnapshot().networks[0]?.endpoints.every(({ status }) => status === "available")).toBe(true);
+        expect(vi.getTimerCount()).toBe(0);
+        await manager.close();
+    });
+
+    it.each(["signal", "close", "deadline"] as const)("preserves %s cancellation during verification", async (kind) => {
+        vi.useFakeTimers();
+        const request = vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => { reject(init.signal?.reason as Error); }, { once: true });
+        }));
+        vi.stubGlobal("fetch", request);
+        const controller = new AbortController();
+        const reason = new Error("cancelled");
+        const manager = new RpcPoolManager({ ...config, requestTimeoutMs: 200 });
+        const operation = manager.broadcastTransaction(1, broadcastTx, { signal: controller.signal });
+        const rejection = kind === "signal"
+            ? expect(operation).rejects.toBe(reason)
+            : expect(operation).rejects.toBeInstanceOf(kind === "close" ? RpcPoolClosedError : OperationTimeoutError);
+        await vi.advanceTimersByTimeAsync(0);
+        if (kind === "signal")
+            controller.abort(reason);
+        if (kind === "close")
+            await manager.close();
+        await vi.advanceTimersByTimeAsync(kind === "deadline" ? 100 : 0);
+        await rejection;
+        expect(manager.getSnapshot().totalActiveGroups).toBe(0);
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]?.status).toBe("available");
+        expect(vi.getTimerCount()).toBe(0);
+        await manager.close();
+    });
+
+    it("does no work for a pre-aborted signal or closed manager", async () => {
+        const request = vi.fn();
+        vi.stubGlobal("fetch", request);
+        const manager = broadcastManager();
+        const reason = new Error("already cancelled");
+        await expect(manager.broadcastTransaction(1, broadcastTx, { signal: AbortSignal.abort(reason) }))
+            .rejects.toBe(reason);
+        await manager.close();
+        await expect(manager.broadcastTransaction(1, broadcastTx)).rejects.toBeInstanceOf(RpcPoolClosedError);
+        expect(request).not.toHaveBeenCalled();
+    });
+
+    it("spends the same deadline while waiting for availability", async () => {
+        const manager = await createManagerDuringCooldown();
+        const operation = manager.broadcastTransaction(1, broadcastTx, { timeoutMs: 100 });
+        const rejection = expect(operation).rejects.toBeInstanceOf(OperationTimeoutError);
+        await vi.advanceTimersByTimeAsync(100);
+        await rejection;
+        expect(manager.getSnapshot().totalActiveGroups).toBe(0);
+        expect(vi.getTimerCount()).toBe(0);
+        await manager.close();
+    });
+});
+describe("broadcast concurrency boundaries", () => {
+    afterEach(() => {
+        vi.restoreAllMocks();
+        vi.unstubAllGlobals();
+        vi.useRealTimers();
+    });
+    it("rejects a reservation invalidated by a concurrent read before sending", async () => {
+        vi.useFakeTimers();
+        const verification = deferred<Response>();
+        let first = true;
+        vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) => {
+            const payload = broadcastPayload(init);
+            if (first) {
+                first = false;
+                return verification.promise;
+            }
+            return Promise.resolve(broadcastResponse(payload));
+        }));
+        const manager = broadcastManager(1);
+        const broadcast = manager.broadcastTransaction(1, broadcastTx);
+        const rejection = expect(broadcast).rejects.toMatchObject({ failures: [{ outcome: "not-sent" }] });
+        await expect(manager.executeOnce(1, () => Promise.reject(new RpcEndpointDataError())))
+            .rejects.toBeInstanceOf(RpcEndpointDataError);
+        verification.resolve(Response.json({ id: 1, jsonrpc: "2.0", result: "0x1" }));
+        await rejection;
+        await vi.advanceTimersByTimeAsync(0);
+        expect(manager.getSnapshot().requestsByMethod.eth_sendRawTransaction).toBeUndefined();
+        expect(manager.getSnapshot().totalActiveGroups).toBe(0);
+        expect(vi.getTimerCount()).toBe(0);
+        await manager.close();
+    });
+
+    it("keeps an unrelated read alive when broadcast is cancelled", async () => {
+        vi.useFakeTimers();
+        const reading = deferred<Response>();
+        let readPayload: BroadcastPayload | undefined;
+        let readSignal: AbortSignal | null | undefined;
+        vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) => {
+            const payload = broadcastPayload(init);
+            if (payload.method === "eth_chainId")
+                return Promise.resolve(broadcastResponse(payload));
+            if (payload.method === "eth_blockNumber") {
+                readPayload = payload;
+                readSignal = init?.signal;
+                return reading.promise;
+            }
+            return new Promise<Response>((_resolve, reject) => {
+                init?.signal?.addEventListener("abort", () => {
+                    reject(init.signal?.reason as Error);
+                }, { once: true });
+            });
+        }));
+        const manager = broadcastManager(1);
+        const controller = new AbortController();
+        const reason = new Error("stop broadcast");
+        const read = manager.executeOnce(1, async (provider) => await provider.send("eth_blockNumber", []) as unknown);
+        await vi.advanceTimersByTimeAsync(0);
+        const broadcast = manager.broadcastTransaction(1, broadcastTx, { signal: controller.signal });
+        const rejection = expect(broadcast).rejects.toBe(reason);
+        await vi.advanceTimersByTimeAsync(0);
+        controller.abort(reason);
+        await rejection;
+        await vi.advanceTimersByTimeAsync(0);
+        expect(readSignal?.aborted).toBe(false);
+        expect(manager.getSnapshot().totalActiveGroups).toBe(1);
+        if (readPayload === undefined)
+            throw new Error("Expected read request");
+        reading.resolve(broadcastResponse(readPayload, "0x2a"));
+        await expect(read).resolves.toBe("0x2a");
+        await vi.advanceTimersByTimeAsync(0);
+        expect(vi.getTimerCount()).toBe(0);
+        await manager.close();
+    });
+
+    it.each(["resolve", "reject"] as const)("ignores late %s after cancellation of a probe", async (settle) => {
+        vi.useFakeTimers();
+        vi.spyOn(Math, "random").mockReturnValue(0);
+        const late = deferred<Response>();
+        let pendingPayload: BroadcastPayload | undefined;
+        vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) => {
+            const payload = broadcastPayload(init);
+            if (payload.method === "eth_chainId")
+                return Promise.resolve(broadcastResponse(payload));
+            pendingPayload = payload;
+            return late.promise;
+        }));
+        const manager = broadcastManager(1);
+        await expect(manager.executeOnce(1, () => Promise.reject(new RpcEndpointDataError())))
+            .rejects.toBeInstanceOf(RpcEndpointDataError);
+        await vi.advanceTimersByTimeAsync(5000);
+        const controller = new AbortController();
+        const reason = new Error("cancel probe");
+        const operation = manager.broadcastTransaction(1, broadcastTx, { signal: controller.signal });
+        const rejection = expect(operation).rejects.toBe(reason);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]?.status).toBe("probe");
+        controller.abort(reason);
+        await rejection;
+        expect(manager.getSnapshot().totalActiveGroups).toBe(0);
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]?.status).toBe("cooling-down");
+        if (pendingPayload === undefined)
+            throw new Error("Expected send request");
+        if (settle === "resolve")
+            late.resolve(broadcastResponse(pendingPayload));
+        else
+            late.reject(new Error("late network rejection"));
+        await vi.advanceTimersByTimeAsync(0);
+        expect(manager.getSnapshot().totalActiveGroups).toBe(0);
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]?.status).toBe("cooling-down");
+        expect(vi.getTimerCount()).toBe(0);
+        await manager.close();
+    });
+
+    it("cancellation wins when acceptance is delivered in the same turn", async () => {
+        vi.useFakeTimers();
+        const response = deferred<Response>();
+        let payload: BroadcastPayload | undefined;
+        vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) => {
+            const current = broadcastPayload(init);
+            if (current.method === "eth_chainId")
+                return Promise.resolve(broadcastResponse(current));
+            payload = current;
+            return response.promise;
+        }));
+        const manager = broadcastManager(1);
+        const controller = new AbortController();
+        const reason = new Error("cancel race");
+        const operation = manager.broadcastTransaction(1, broadcastTx, { signal: controller.signal });
+        const rejection = expect(operation).rejects.toBe(reason);
+        await vi.advanceTimersByTimeAsync(0);
+        if (payload === undefined)
+            throw new Error("Expected send request");
+        response.resolve(broadcastResponse(payload));
+        controller.abort(reason);
+        await rejection;
+        await vi.advanceTimersByTimeAsync(0);
+        expect(manager.getSnapshot().totalActiveGroups).toBe(0);
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]?.status).toBe("available");
+        expect(vi.getTimerCount()).toBe(0);
+        await manager.close();
     });
 });

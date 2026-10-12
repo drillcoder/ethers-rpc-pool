@@ -138,6 +138,44 @@ console.log(transaction.hash);
 If a write reaches the RPC server and the response is lost, the returned operation fails while the on-chain result is
 unknown. Inspect the chain or application state before deciding whether to submit it again.
 
+### Parallel transaction broadcast
+
+`broadcastTransaction(chainId, signedTx, options?)` sends one already signed transaction to different eligible endpoints and returns `Promise<string>`. Sign and supply the nonce, fees, gas and chain ID beforehand:
+
+```ts
+import { Wallet } from "ethers";
+import { RpcPoolManager } from "@drillcoder/ethers-rpc-pool";
+
+const pool = new RpcPoolManager({
+    networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
+    operationTimeoutMs: 10_000,
+    requestTimeoutMs: 3_000,
+});
+const wallet = new Wallet(process.env.PRIVATE_KEY!);
+const signedTx = await wallet.signTransaction({
+    chainId: 1,
+    type: 2,
+    nonce: 0,
+    to: "0x0000000000000000000000000000000000000001",
+    value: 1n,
+    gasLimit: 21_000n,
+    maxFeePerGas: 20_000_000_000n,
+    maxPriorityFeePerGas: 1_000_000_000n,
+});
+const hash: string = await pool.broadcastTransaction(1, signedTx, { maxCount: 3 });
+console.log(hash);
+// Keep the pool open for remaining sends; close it when the application exits.
+```
+
+The default `maxCount` is `3`; any positive safe integer is accepted, including `1`. The pool starts up to that many eligible endpoints immediately, even when fewer are available. Each branch verifies the network and sends the original bytes once. Failed branches are never retried or replaced. Independent RPC providers can offer more propagation paths even when different configured URLs share a backend.
+
+The returned hash is computed locally and confirms the first matching RPC reply or exact JSON-RPC `already known` reply. It does not confirm inclusion in a block. `nonce too low` is a failure. Remaining sends continue after the hash returns, with their own endpoint health and counters. Unlike `executeOnce()`, this method accepts transaction bytes rather than a callback and deliberately submits those same bytes to several endpoints.
+
+`timeoutMs ?? operationTimeoutMs` is one budget for availability, verification and all sends. The timer stays active until every branch finishes. `signal` continues to cancel remaining HTTP requests after the hash returns; `close()` and the deadline also stop them. None of these later events changes the returned hash. Closing immediately after awaiting the hash can therefore stop propagation to slower endpoints.
+
+If no branch confirms acceptance, `RpcBroadcastError` contains `chainId`, the local `hash`, and readonly `failures` in endpoint selection order. Each failure has `endpointNumber`, the original `error`, and `outcome`: `not-sent` (failed before sending), `rejected` (explicit JSON-RPC refusal), or `unknown` (delivery may have happened, but the response was lost or invalid). An error with `unknown` does not prove the transaction is absent from the network. Unknown networks, no eligible endpoints, closure, operation timeout and cancellation preserve their existing error types or signal reason.
+
+
 ## Provider lifetime and listeners
 
 Each endpoint has one shared `JsonRpcProvider` owned by the manager. Completing a callback leaves that provider and

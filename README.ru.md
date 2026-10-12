@@ -138,6 +138,44 @@ console.log(transaction.hash);
 Если запись дошла до RPC-сервера, а ответ потерялся, операция завершится ошибкой при неизвестном результате в сети.
 Перед повторной отправкой проверьте состояние сети или приложения.
 
+### Параллельная рассылка транзакции
+
+`broadcastTransaction(chainId, signedTx, options?)` отправляет одну уже подписанную транзакцию разным пригодным endpoint и возвращает `Promise<string>`. Заранее задайте nonce, fees, gas и chain ID и подпишите tx:
+
+```ts
+import { Wallet } from "ethers";
+import { RpcPoolManager } from "@drillcoder/ethers-rpc-pool";
+
+const pool = new RpcPoolManager({
+    networks: [{ chainId: 1, rpcUrls: ["https://first.example", "https://second.example"] }],
+    operationTimeoutMs: 10_000,
+    requestTimeoutMs: 3_000,
+});
+const wallet = new Wallet(process.env.PRIVATE_KEY!);
+const signedTx = await wallet.signTransaction({
+    chainId: 1,
+    type: 2,
+    nonce: 0,
+    to: "0x0000000000000000000000000000000000000001",
+    value: 1n,
+    gasLimit: 21_000n,
+    maxFeePerGas: 20_000_000_000n,
+    maxPriorityFeePerGas: 1_000_000_000n,
+});
+const hash: string = await pool.broadcastTransaction(1, signedTx, { maxCount: 3 });
+console.log(hash);
+// Не закрывайте пул, пока продолжаются остальные отправки; закройте его при завершении приложения.
+```
+
+Default `maxCount` — `3`; допустим любой положительный safe integer, включая `1`. Пул сразу запускает до этого числа пригодных endpoint, даже если доступно меньше. Каждая ветка проверяет сеть и один раз отправляет исходные байты. Неуспешные ветки не повторяются и не заменяются. Независимые RPC-провайдеры могут дать больше путей распространения; разные настроенные URL могут вести к одному backend.
+
+Локально вычисленный хэш возвращается после первого совпадающего RPC-ответа или точного JSON-RPC `already known`. Это не подтверждает включение в блок. `nonce too low` остаётся ошибкой. Остальные отправки продолжаются после возврата хэша, сохраняя обработку здоровья endpoint и counters. В отличие от `executeOnce()`, метод принимает байты tx вместо callback и намеренно отправляет одинаковые байты нескольким endpoint.
+
+`timeoutMs ?? operationTimeoutMs` — единый бюджет для ожидания доступности, проверки сети и всех отправок. Таймер действует до завершения всех веток. `signal` отменяет остаточные HTTP-запросы и после возврата хэша; `close()` и deadline также их останавливают. Эти поздние события не меняют уже возвращённый хэш. Поэтому закрытие сразу после получения хэша может остановить распространение через медленные endpoint.
+
+Если ни одна ветка не подтвердила принятие, `RpcBroadcastError` содержит `chainId`, локальный `hash` и readonly `failures` в порядке выбора endpoint. В каждой записи есть `endpointNumber`, исходная `error` и `outcome`: `not-sent` (сбой до отправки), `rejected` (явный JSON-RPC отказ) или `unknown` (доставка могла состояться, но ответ потерян или некорректен). `unknown` не доказывает отсутствие tx в сети. Неизвестная сеть, отсутствие пригодных endpoint, закрытие, общий timeout и отмена сохраняют прежние типы ошибок или исходную причину сигнала.
+
+
 ## Время жизни provider и listeners
 
 Каждый endpoint имеет один общий `JsonRpcProvider`, которым владеет менеджер. Завершение callback сохраняет provider

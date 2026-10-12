@@ -7,6 +7,7 @@ describe("public runtime exports", () => {
         expect(Object.keys(publicApi).sort()).toEqual([
             "NoUsableRpcEndpointError",
             "OperationTimeoutError",
+    "RpcBroadcastError",
             "RpcEndpointDataError",
             "RpcPoolClosedError",
             "RpcPoolManager",

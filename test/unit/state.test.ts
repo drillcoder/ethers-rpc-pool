@@ -127,6 +127,37 @@ function reserveExpiredProbe(): {
 }
 
 describe("reserveEndpoint", () => {
+    it("excludes previously selected endpoints even with very different latency", () => {
+        const network = createNetwork();
+        const [first, second] = network.endpoints;
+        if (first === undefined || second === undefined) throw new Error("Expected endpoints");
+        first.latencyEwmaMs = 1;
+        second.latencyEwmaMs = 1000;
+        expect(reserveEndpoint(network, 0)?.endpoint).toBe(first);
+        expect(reserveEndpoint(network, 0)?.endpoint).toBe(first);
+        const excluded = new Set([first]);
+        expect(reserveEndpoint(network, 0, "once", false, excluded)?.endpoint).toBe(second);
+        excluded.add(second);
+        expect(reserveEndpoint(network, 0, "once", false, excluded)).toBeNull();
+        expect(network.primaryRetrySelections).toBe(0);
+    });
+
+    it("keeps cooldown, exclusions and the single probe slot when selecting a smaller set", () => {
+        const network = createNetwork();
+        const [first, second] = network.endpoints;
+        if (first === undefined || second === undefined) throw new Error("Expected endpoints");
+        first.status = "cooling-down";
+        first.cooldownUntil = 100;
+        second.status = "excluded";
+        expect(reserveEndpoint(network, 99, "once", false, new Set())).toBeNull();
+        expect(reserveEndpoint(network, 100, "once", false, new Set([first]))).toBeNull();
+        expect(first.status).toBe("cooling-down");
+        expect(reserveEndpoint(network, 100)?.requiresProbe).toBe(true);
+        expect(reserveEndpoint(network, 100, "once", false, new Set())).toBeNull();
+        expect(first.activeGroups).toBe(1);
+        expect(network.primaryRetrySelections).toBe(0);
+    });
+
     it("minimizes latency multiplied by active groups plus one", () => {
         const network = createNetwork();
         const first = network.endpoints[0];

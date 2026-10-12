@@ -1,11 +1,14 @@
 import type { JsonRpcProvider } from "ethers";
+import { Transaction } from "ethers";
 
 import {
     OperationTimeoutError,
+    RpcBroadcastError,
     RpcEndpointDataError,
     RpcPoolClosedError,
     UnknownNetworkError,
 } from "../errors/errors.js";
+import type { RpcBroadcastFailure } from "../errors/errors.js";
 import {
     createEndpointCounters,
     createRpcCounters,
@@ -15,7 +18,7 @@ import {
 import type { RpcErrorCategory, RpcPoolLogger, RpcPoolLoggerEvent, RpcPoolSnapshot } from "../observability/types.js";
 import { EndpointChainIdVerifier, RpcChainIdMismatchError } from "../transport/chain-id.js";
 import type { RpcErrorClassification } from "../transport/classification.js";
-import { EndpointJsonRpcProvider, getRpcFailure } from "../transport/provider.js";
+import { EndpointJsonRpcProvider, getRpcErrorResponse, getRpcFailure } from "../transport/provider.js";
 import { normalizeManagerConfig } from "./config.js";
 import { EndpointReservationUnavailableError } from "./attempt.js";
 import {
@@ -34,8 +37,9 @@ import {
     updateEndpointLatency,
     waitForEndpointAvailability,
 } from "./state.js";
-import type { EndpointFailureStreaks, EndpointState, NetworkState, PoolState } from "./state.js";
+import type { EndpointFailureStreaks, EndpointReservation, EndpointState, NetworkState, PoolState } from "./state.js";
 import type {
+    RpcBroadcastOptions,
     RpcExecutionOptions,
     RpcPoolManagerConfig,
 } from "./types.js";
@@ -294,6 +298,69 @@ export class RpcPoolManager {
         );
     }
 
+    public async broadcastTransaction(
+        chainId: number,
+        signedTx: string,
+        options: RpcBroadcastOptions = {},
+    ): Promise<string> {
+        this.#assertOpen();
+        const network = this.#network(chainId);
+        const maxCount = options.maxCount ?? 3;
+        if (!Number.isSafeInteger(maxCount) || maxCount <= 0) {
+            throw new RangeError("maxCount must be a positive safe integer");
+        }
+        const timeoutMs = options.timeoutMs ?? this.#operationTimeoutMs;
+        assertOperationTimeout(timeoutMs);
+        options.signal?.throwIfAborted();
+        const transaction = Transaction.from(signedTx);
+        const hash = transaction.hash;
+        if (transaction.signature === null || hash === null) {
+            throw new TypeError("signedTx must contain a signed transaction");
+        }
+        if (transaction.chainId !== BigInt(chainId)) {
+            throw new TypeError("signedTx chain ID must match the requested network");
+        }
+        const deadlineMs = this.#runtime.monotonicNow() + timeoutMs;
+        const deadline = new OperationDeadline(this.#runtime, chainId, timeoutMs, deadlineMs);
+        const operationOptions = this.#operationOptions(options, deadline.signal);
+        let launched = false;
+        try {
+            const reservations: EndpointReservation<ManagedEndpoint>[] = [];
+            const excluded = new Set<ManagedEndpoint>();
+            for (;;) {
+                operationOptions.signal.throwIfAborted();
+                for (let index = 0; index < maxCount; index += 1) {
+                    const reservation = reserveEndpoint(network, this.#runtime.monotonicNow(), "once", false, excluded);
+                    if (reservation === null) break;
+                    reservations.push(reservation);
+                    excluded.add(reservation.endpoint);
+                }
+                if (reservations.length > 0) break;
+                await this.#waitForEndpoint(network, operationOptions);
+            }
+            const failures: RpcBroadcastFailure[] = [];
+            const branches = reservations.map((reservation, index) => this.#broadcastBranch(
+                network,
+                reservation,
+                signedTx,
+                hash,
+                operationOptions,
+                deadlineMs,
+                (failure) => { failures[index] = failure; },
+            ));
+            launched = true;
+            void Promise.allSettled(branches).then(() => { deadline.clear(); });
+            try {
+                return await raceWithAbort(() => Promise.any(branches), operationOptions.signal);
+            } catch {
+                operationOptions.signal.throwIfAborted();
+                throw new RpcBroadcastError(chainId, hash, failures);
+            }
+        } finally {
+            if (!launched) deadline.clear();
+        }
+    }
+
     public close(): Promise<void> {
         if (this.#closePromise !== null) {
             return this.#closePromise;
@@ -533,5 +600,69 @@ export class RpcPoolManager {
             : [options.signal, this.#closeController.signal, deadlineSignal];
         const signal = AbortSignal.any(signals);
         return { ...options, signal };
+    }
+
+    async #broadcastBranch(
+        network: NetworkState<ManagedEndpoint>,
+        reservation: EndpointReservation<ManagedEndpoint>,
+        signedTx: string,
+        hash: string,
+        options: OperationOptions,
+        deadlineMs: number,
+        reportFailure: (failure: RpcBroadcastFailure) => void,
+    ): Promise<string> {
+        const endpoint = reservation.endpoint;
+        let sent = false;
+        try {
+            const result = await runEndpointReservation(network, reservation, async () =>
+                await endpoint.provider.runWithDeadline(deadlineMs, async () =>
+                    await raceWithAbort(async () => {
+                        await endpoint.verifier.verify();
+                        options.signal.throwIfAborted();
+                        if (!isEndpointReservationCurrent(reservation)) throw new EndpointReservationUnavailableError();
+                        sent = true;
+                        let response: unknown;
+                        try {
+                            response = await endpoint.provider.send("eth_sendRawTransaction", [signedTx]);
+                        } catch (error: unknown) {
+                            options.signal.throwIfAborted();
+                            const rpcResponse = getRpcErrorResponse(error);
+                            const failure = getRpcFailure(error);
+                            if (
+                                rpcResponse?.method !== "eth_sendRawTransaction"
+                                || rpcResponse.error.message?.trim().toLowerCase() !== "already known"
+                                || failure?.action !== "none"
+                                || failure.category !== "unknown"
+                            ) {
+                                throw error;
+                            }
+                            return hash;
+                        }
+                        options.signal.throwIfAborted();
+                        if (typeof response !== "string" || response.toLowerCase() !== hash.toLowerCase()) {
+                            throw new RpcEndpointDataError("RPC endpoint returned an invalid transaction hash");
+                        }
+                        return hash;
+                    }, options.signal), options.signal, () => isEndpointReservationCurrent(reservation)));
+            this.#emitRecovery(reservation.requiresProbe, endpoint);
+            return result;
+        } catch (error: unknown) {
+            options.signal.throwIfAborted();
+            this.#handleFailure(endpoint, error, sent, "once");
+            notifyNetworkStateChanged(network);
+            reportFailure({
+                endpointNumber: endpoint.endpointNumber,
+                error,
+                outcome: this.#broadcastOutcome(sent, error),
+            });
+            throw error;
+        }
+    }
+
+    #broadcastOutcome(sent: boolean, error: unknown): RpcBroadcastFailure["outcome"] {
+        if (!sent) {
+            return "not-sent";
+        }
+        return getRpcErrorResponse(error) === undefined ? "unknown" : "rejected";
     }
 }

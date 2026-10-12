@@ -6,6 +6,7 @@ import { createServer } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
+import { Wallet, Transaction } from "ethers";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const temporaryRoot = path.join(root, "test/package/.tmp");
@@ -16,6 +17,7 @@ const packageName = "@drillcoder/ethers-rpc-pool";
 const runtimeExports = [
     "NoUsableRpcEndpointError",
     "OperationTimeoutError",
+    "RpcBroadcastError",
     "RpcEndpointDataError",
     "RpcPoolClosedError",
     "RpcPoolManager",
@@ -101,6 +103,8 @@ await writeJson(path.join(projectRoot, "tsconfig.json"), {
 await writeFile(path.join(projectRoot, "index.ts"), `
 import { RpcPoolManager } from "${packageName}";
 import type {
+    RpcBroadcastOptions,
+    RpcBroadcastFailure,
     RpcExecutionOptions,
     RpcPoolLoggerEvent,
     RpcPoolManagerConfig,
@@ -114,13 +118,28 @@ const config: RpcPoolManagerConfig = {
 };
 const manager = new RpcPoolManager(config);
 const values: [
+    RpcBroadcastOptions?,
+    RpcBroadcastFailure?,
     RpcExecutionOptions?,
     RpcPoolLoggerEvent?,
     RpcPoolSnapshot?,
 ] = [];
 void values;
+const send: (
+    chainId: number,
+    signedTx: string,
+    options?: RpcBroadcastOptions
+) => Promise<string> = manager.broadcastTransaction.bind(manager);
+const once: Promise<number> = manager.executeOnce(1, async (provider) => await provider.getBlockNumber());
+const retry: Promise<number> = manager.executeWithRetry(1, async (provider) => await provider.getBlockNumber());
+void send;
+void once.catch(() => undefined);
+void retry.catch(() => undefined);
 await manager.close();
 `);
+const broadcastExample = readmeExamples[0].find(({ code }) => code.includes("broadcastTransaction("));
+assert(broadcastExample !== undefined);
+await writeFile(path.join(projectRoot, "broadcast-example.ts"), broadcastExample.code);
 const readmeServer = createReadmeRpcServer();
 readmeServer.listen(0, "127.0.0.1");
 await once(readmeServer, "listening");
@@ -146,6 +165,28 @@ try {
 
 const publicApi = await import(packageName);
 assert.deepEqual(Object.keys(publicApi).sort(), runtimeExports);
+const broadcastServer = createReadmeRpcServer();
+broadcastServer.listen(0, "127.0.0.1");
+await once(broadcastServer, "listening");
+const broadcastAddress = broadcastServer.address();
+assert(broadcastAddress !== null && typeof broadcastAddress === "object");
+const broadcastPool = new publicApi.RpcPoolManager({
+    networks: [{ chainId: 1, rpcUrls: [`http://127.0.0.1:${broadcastAddress.port}`] }],
+    operationTimeoutMs: 1_000,
+    requestTimeoutMs: 1_000,
+});
+try {
+    const signed = await new Wallet("0x" + "11".repeat(32)).signTransaction({
+        chainId: 1, gasLimit: 21_000, nonce: 0, gasPrice: 1,
+    });
+    assert.equal(await broadcastPool.broadcastTransaction(1, signed, { maxCount: 1 }), Transaction.from(signed).hash);
+} finally {
+    await broadcastPool.close();
+    await new Promise((resolve, reject) => broadcastServer.close((error) => {
+        if (error === undefined) resolve();
+        else reject(error);
+    }));
+}
 const manager = new publicApi.RpcPoolManager({
     networks: [{ chainId: 1, rpcUrls: ["https://rpc.example"] }],
     operationTimeoutMs: 1_000,
@@ -199,7 +240,9 @@ function createReadmeRpcServer() {
         });
         request.on("end", () => {
             const payload = JSON.parse(body);
-            const result = payload.method === "eth_chainId" ? "0x1" : "0x2a";
+            const result = payload.method === "eth_chainId"
+                ? "0x1"
+                : payload.method === "eth_sendRawTransaction" ? Transaction.from(payload.params[0]).hash : "0x2a";
             response.writeHead(200, { "content-type": "application/json" });
             response.end(JSON.stringify({ id: payload.id, jsonrpc: "2.0", result }));
         });

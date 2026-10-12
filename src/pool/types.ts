@@ -16,3 +16,7 @@ export interface RpcExecutionOptions {
     readonly timeoutMs?: number;
     readonly signal?: AbortSignal;
 }
+
+export interface RpcBroadcastOptions extends RpcExecutionOptions {
+    readonly maxCount?: number;
+}

@@ -118,8 +118,9 @@ export function reserveEndpoint<Endpoint extends EndpointState>(
     nowMs: number,
     mode: EndpointSelectionMode = "once",
     primaryAttempt = false,
+    excluded: ReadonlySet<Endpoint> = new Set(),
 ): EndpointReservation<Endpoint> | null {
-    const candidates = getEndpointCandidates(network, nowMs);
+    const candidates = getEndpointCandidates(network, nowMs).filter(({ endpoint }) => !excluded.has(endpoint));
     const coldCandidates = mode === "retry" && primaryAttempt
         ? candidates.filter(({ endpoint }) =>
             endpoint.latencyEwmaMs === null && endpoint.activeGroups === 0)

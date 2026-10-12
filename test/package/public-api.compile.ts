@@ -1,5 +1,7 @@
 import type * as publicApi from "../../src/index.js";
 import type {
+    RpcBroadcastOptions,
+    RpcBroadcastFailure,
     RpcCooldownLoggerEvent,
     RpcEndpointExcludedReason,
     RpcEndpointSnapshot,
@@ -30,12 +32,15 @@ type Expect<Value extends true> = Value;
 type RuntimeExportName =
     | "NoUsableRpcEndpointError"
     | "OperationTimeoutError"
+    | "RpcBroadcastError"
     | "RpcEndpointDataError"
     | "RpcPoolClosedError"
     | "RpcPoolManager"
     | "UnknownNetworkError";
 
 type TypeOnlyExportName =
+    | "RpcBroadcastOptions"
+    | "RpcBroadcastFailure"
     | "RpcCooldownLoggerEvent"
     | "RpcEndpointExcludedReason"
     | "RpcEndpointSnapshot"
@@ -55,6 +60,8 @@ type TypeOnlyExportName =
     | "RpcSwitchLoggerEvent";
 
 export type PublicTypeImports = [
+    RpcBroadcastOptions,
+    RpcBroadcastFailure,
     RpcCooldownLoggerEvent,
     RpcEndpointExcludedReason,
     RpcEndpointSnapshot,
@@ -80,4 +87,8 @@ export type RuntimeExportsAreExact = Expect<
 
 export type TypeOnlyExportsHaveNoRuntimeValues = Expect<
     Equal<Extract<TypeOnlyExportName, keyof typeof publicApi>, never>
+>;
+
+export type BroadcastReturnsHash = Expect<
+    Equal<ReturnType<publicApi.RpcPoolManager["broadcastTransaction"]>, Promise<string>>
 >;

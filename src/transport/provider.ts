@@ -54,7 +54,17 @@ interface TransportResult {
     readonly status: number;
 }
 
+interface RpcErrorResponse {
+    readonly method: string;
+    readonly error: Readonly<JsonRpcError["error"]>;
+}
+
 const rpcFailures = new WeakMap<object, RpcErrorClassification>();
+const rpcErrorResponses = new WeakMap<object, RpcErrorResponse>();
+
+export function getRpcErrorResponse(error: unknown): RpcErrorResponse | undefined {
+    return typeof error === "object" && error !== null ? rpcErrorResponses.get(error) : undefined;
+}
 
 function markRpcFailure(error: object, failure: RpcErrorClassification): void {
     rpcFailures.set(error, failure);
@@ -258,6 +268,10 @@ export class EndpointJsonRpcProvider extends JsonRpcProvider {
                 const error = super.getRpcError(payload, result as JsonRpcError);
                 const failure = classifyRpcTransportError(transportError, finishedAt);
                 markRpcFailure(error, failure);
+                rpcErrorResponses.set(error, {
+                    method: payload.method,
+                    error: Object.freeze({ ...(result as JsonRpcError).error }),
+                });
                 this.#observer?.onError(
                     payload.method,
                     error,
