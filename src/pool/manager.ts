@@ -217,7 +217,7 @@ async function raceWithAbort<Result>(startOperation: () => Promise<Result>, sign
     try {
         operation = Promise.resolve(startOperation());
     } catch (error) {
-        // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- Preserve arbitrary callback rejection.
+        // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- Preserve callback rejection.
         operation = Promise.reject(error);
     }
     if (signal.aborted) {
@@ -490,7 +490,11 @@ export class RpcPoolManager {
     }
 
     #emitSwitch(previousFailure: PreviousFailure | undefined, endpoint: ManagedEndpoint): void {
-        if (previousFailure === undefined || previousFailure.endpoint === endpoint || !previousFailure.endpoint.loggingEnabled) {
+        if (
+            previousFailure === undefined
+            || previousFailure.endpoint === endpoint
+            || !previousFailure.endpoint.loggingEnabled
+        ) {
             return;
         }
         previousFailure.endpoint.emit({

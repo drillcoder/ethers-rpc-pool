@@ -35,6 +35,7 @@ export default tseslint.config(
         rules: {
             "comma-dangle": ["error", "always-multiline"],
             "function-call-argument-newline": ["error", "consistent"],
+            "max-len": ["error", { code: 120 }],
         },
     },
     {

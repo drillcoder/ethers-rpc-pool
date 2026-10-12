@@ -230,7 +230,7 @@ describe("EndpointJsonRpcProvider", () => {
     });
 
     it("passes through a primitive transport rejection without inventing provenance", async () => {
-        // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- Exercise an arbitrary fetch rejection.
+        // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- Exercise arbitrary rejection.
         const provider = new EndpointJsonRpcProvider(rpcUrl, 1, providerOptions(() => Promise.reject("offline")));
         await expect(provider.send("eth_blockNumber", [])).rejects.toBe("offline");
         expect(getRpcFailure("offline")).toBeUndefined();
