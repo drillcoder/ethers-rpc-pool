@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/drillcoder/ethers-rpc-pool/compare/v1.0.0...v1.1.0) (2026-10-13)
+
+
+### Features
+
+* add parallel transaction broadcast ([36d741d](https://github.com/drillcoder/ethers-rpc-pool/commit/36d741dcf6a5d9c0d1edf972edf0884b66bb2633))
+
 # Changelog
 
 All notable changes to this project are documented in this file. Releases are generated automatically from
