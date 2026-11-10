@@ -1,3 +1,10 @@
+## [1.1.1](https://github.com/drillcoder/ethers-rpc-pool/compare/v1.1.0...v1.1.1) (2026-11-10)
+
+
+### Bug Fixes
+
+* count concurrent failures of one incident as a single cooldown step ([e4398e0](https://github.com/drillcoder/ethers-rpc-pool/commit/e4398e086751d6ae2baa27bed6e50c1170f393b9))
+
 # [1.1.0](https://github.com/drillcoder/ethers-rpc-pool/compare/v1.0.0...v1.1.0) (2026-10-13)
 
 
