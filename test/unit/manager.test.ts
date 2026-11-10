@@ -75,6 +75,35 @@ async function createManagerDuringCooldown(): Promise<RpcPoolManager> {
     return manager;
 }
 
+function createPendingTransportManager(): {
+    readonly events: RpcPoolLoggerEvent[];
+    readonly manager: RpcPoolManager;
+    readonly pending: ((response: Response) => void)[];
+} {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const events: RpcPoolLoggerEvent[] = [];
+    const pending: ((response: Response) => void)[] = [];
+    vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+        const payload = JSON.parse(init?.body as string) as { method: string };
+        if (payload.method === "eth_chainId") {
+            return Promise.resolve(rpcResponse(init ?? {}));
+        }
+        return new Promise<Response>((resolve) => {
+            pending.push(resolve);
+        });
+    }));
+    const manager = new RpcPoolManager({
+        ...config,
+        logger: (event) => {
+            events.push(event);
+        },
+        operationTimeoutMs: 10_000,
+        requestTimeoutMs: 5_000,
+    });
+    return { events, manager, pending };
+}
+
 async function createCooledEndpointManager(): Promise<RpcPoolManager> {
     const manager = await createManagerDuringCooldown();
     await vi.advanceTimersByTimeAsync(5_000);
@@ -1197,6 +1226,90 @@ describe("RpcPoolManager operation entry points", () => {
         expect(firstEndpoint?.cooldownUntil).toBeGreaterThanOrEqual(startedAt + 600_000);
         expect(firstEndpoint?.cooldownUntil).toBeLessThanOrEqual(Date.now() + 720_000);
         expect(manager.getSnapshot().errorsByCategory).toEqual({ "quota-limit": 1 });
+        await manager.close();
+    });
+
+    it("counts concurrent rate limits of one incident as a single cooldown step", async () => {
+        const { events, manager, pending } = createPendingTransportManager();
+        const operations = Array.from({ length: 3 }, () => manager
+            .executeOnce(1, async (client) => await client.getBlockNumber())
+            .catch((error: unknown) => error));
+        await vi.advanceTimersByTimeAsync(0);
+        expect(pending).toHaveLength(3);
+
+        const failedAt = Date.now();
+        for (const respond of pending.splice(0)) {
+            respond(Response.json({}, { status: 429 }));
+        }
+        await Promise.all(operations);
+
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]?.cooldownUntil).toBeCloseTo(failedAt + 30_000);
+        expect(manager.getSnapshot().errorsByCategory).toEqual({ "rate-limit": 3 });
+        expect(events.filter(({ type }) => type === "cooldown")).toHaveLength(1);
+
+        await vi.advanceTimersByTimeAsync(30_001);
+        const probe = manager.executeOnce(1, async (client) => await client.getBlockNumber()).catch(() => undefined);
+        await vi.advanceTimersByTimeAsync(0);
+        const probedAt = Date.now();
+        pending.splice(0).forEach((respond) => {
+            respond(Response.json({}, { status: 429 }));
+        });
+        await probe;
+
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]?.cooldownUntil).toBeCloseTo(probedAt + 60_000);
+        await manager.close();
+    });
+
+    it("lets a concurrent failure extend the cooldown by Retry-After without growing the streak", async () => {
+        const { events, manager, pending } = createPendingTransportManager();
+        const operations = Array.from({ length: 2 }, () => manager
+            .executeOnce(1, async (client) => await client.getBlockNumber())
+            .catch((error: unknown) => error));
+        await vi.advanceTimersByTimeAsync(0);
+        const [first, second] = pending.splice(0);
+
+        first?.(Response.json({}, { status: 429 }));
+        await vi.advanceTimersByTimeAsync(1_000);
+        const extendedAt = Date.now();
+        second?.(Response.json({}, { headers: { "retry-after": "120" }, status: 429 }));
+        await Promise.all(operations);
+
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]?.cooldownUntil).toBeCloseTo(extendedAt + 120_000);
+        expect(events.filter(({ type }) => type === "cooldown")).toHaveLength(2);
+
+        await vi.advanceTimersByTimeAsync(120_001);
+        const probe = manager.executeOnce(1, async (client) => await client.getBlockNumber()).catch(() => undefined);
+        await vi.advanceTimersByTimeAsync(0);
+        const probedAt = Date.now();
+        pending.splice(0).forEach((respond) => {
+            respond(Response.json({}, { status: 429 }));
+        });
+        await probe;
+
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]?.cooldownUntil).toBeCloseTo(probedAt + 60_000);
+        await manager.close();
+    });
+
+    it("does not refresh an endpoint-data cooldown from a concurrent stale failure", async () => {
+        const { events, manager } = createPendingTransportManager();
+        const firstGate = deferred<undefined>();
+        const secondGate = deferred<undefined>();
+        const fail = (gate: Promise<undefined>) => manager.executeOnce(1, async () => {
+            await gate;
+            throw new RpcEndpointDataError("invalid data");
+        }).catch((error: unknown) => error);
+        const operations = [fail(firstGate.promise), fail(secondGate.promise)];
+        await vi.advanceTimersByTimeAsync(0);
+
+        const failedAt = Date.now();
+        firstGate.resolve(undefined);
+        await vi.advanceTimersByTimeAsync(1_000);
+        secondGate.resolve(undefined);
+        await Promise.all(operations);
+
+        expect(manager.getSnapshot().networks[0]?.endpoints[0]?.cooldownUntil).toBeCloseTo(failedAt + 5_000);
+        expect(manager.getSnapshot().errorsByCategory).toEqual({ "endpoint-data": 2 });
+        expect(events.filter(({ type }) => type === "cooldown")).toHaveLength(1);
         await manager.close();
     });
 

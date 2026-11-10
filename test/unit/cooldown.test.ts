@@ -5,6 +5,7 @@ import {
     applyLongCooldown,
     applyShortCooldown,
     excludeEndpoint,
+    extendCooldown,
 } from "../../src/pool/cooldown.js";
 import { getEndpointCandidates } from "../../src/pool/state.js";
 import type { EndpointState } from "../../src/pool/state.js";
@@ -89,6 +90,44 @@ describe("applyLongCooldown", () => {
         expect(applyLongCooldown(endpoint, 1_000, { random: () => 0.5 }, 600_000)).toBe(661_000);
         expect(endpoint.cooldownUntil).toBe(661_000);
         expect(endpoint.status).toBe("cooling-down");
+    });
+});
+
+describe("extendCooldown", () => {
+    it("honors a longer Retry-After with jitter without growing the streak or the version", () => {
+        const endpoint = createEndpoint();
+
+        applyLongCooldown(endpoint, 1_000, { random: () => 0 });
+        expect(extendCooldown(endpoint, 2_000, { random: () => 0.5 }, 100_000)).toBeCloseTo(112_000);
+        expect(endpoint.cooldownUntil).toBeCloseTo(112_000);
+        expect(endpoint.status).toBe("cooling-down");
+        expect(endpoint.failureStreaks).toEqual({ long: 1, short: 0 });
+        expect(endpoint.version).toBe(1);
+    });
+
+    it("never shortens the current cooldown", () => {
+        const endpoint = createEndpoint();
+
+        applyLongCooldown(endpoint, 1_000, { random: () => 0 });
+        expect(extendCooldown(endpoint, 2_000, { random: () => 0 }, 29_000)).toBeNull();
+        expect(endpoint.cooldownUntil).toBe(31_000);
+    });
+
+    it("sets a deadline for a cooling endpoint without one", () => {
+        const endpoint = createEndpoint();
+
+        endpoint.status = "cooling-down";
+        expect(extendCooldown(endpoint, 1_000, { random: () => 0 }, 1_000)).toBe(2_000);
+    });
+
+    it.each(["available", "probe", "excluded"] as const)("leaves an endpoint with status %s unchanged", (status) => {
+        const endpoint = createEndpoint();
+        const random = vi.fn(() => 0);
+
+        endpoint.status = status;
+        expect(extendCooldown(endpoint, 1_000, { random }, 60_000)).toBeNull();
+        expect(endpoint.cooldownUntil).toBeNull();
+        expect(random).not.toHaveBeenCalled();
     });
 });
 

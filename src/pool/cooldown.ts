@@ -77,6 +77,25 @@ export function applyEndpointDataCooldown(
     return endpoint.cooldownUntil;
 }
 
+export function extendCooldown(
+    endpoint: EndpointState,
+    nowMs: number,
+    runtime: Pick<RuntimeDependencies, "random">,
+    retryAfterMs: number,
+): number | null {
+    if (endpoint.status !== "cooling-down") {
+        return null;
+    }
+
+    const cooldownUntil = nowMs + retryAfterMs * (1 + maximumJitterRatio * runtime.random());
+    if (cooldownUntil <= (endpoint.cooldownUntil ?? Number.NEGATIVE_INFINITY)) {
+        return null;
+    }
+
+    endpoint.cooldownUntil = cooldownUntil;
+    return cooldownUntil;
+}
+
 export function excludeEndpoint(endpoint: EndpointState, reason: NonNullable<EndpointState["excludedReason"]>): void {
     if (endpoint.status === "excluded") {
         return;

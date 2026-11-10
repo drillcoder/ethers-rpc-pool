@@ -17,7 +17,7 @@ import {
 } from "../observability/counters.js";
 import type { RpcErrorCategory, RpcPoolLogger, RpcPoolLoggerEvent, RpcPoolSnapshot } from "../observability/types.js";
 import { EndpointChainIdVerifier, RpcChainIdMismatchError } from "../transport/chain-id.js";
-import type { RpcErrorClassification } from "../transport/classification.js";
+import type { RpcCooldownClassification, RpcErrorClassification } from "../transport/classification.js";
 import { EndpointJsonRpcProvider, getRpcErrorResponse, getRpcFailure } from "../transport/provider.js";
 import { normalizeManagerConfig } from "./config.js";
 import { EndpointReservationUnavailableError } from "./attempt.js";
@@ -26,6 +26,7 @@ import {
     applyLongCooldown,
     applyShortCooldown,
     excludeEndpoint,
+    extendCooldown,
 } from "./cooldown.js";
 import { createRuntime } from "./runtime.js";
 import type { RuntimeDependencies, TimerHandle } from "./runtime.js";
@@ -471,7 +472,7 @@ export class RpcPoolManager {
                 return result;
             } catch (error: unknown) {
                 options.signal.throwIfAborted();
-                const decision = this.#handleFailure(endpoint, error, callbackStarted, mode);
+                const decision = this.#handleFailure(reservation, error, callbackStarted, mode);
                 notifyNetworkStateChanged(network);
                 if (!decision.retry) {
                     throw decision.error;
@@ -483,18 +484,21 @@ export class RpcPoolManager {
     }
 
     #handleFailure(
-        endpoint: ManagedEndpoint,
+        reservation: EndpointReservation<ManagedEndpoint>,
         error: unknown,
         callbackStarted: boolean,
         mode: ExecutionMode,
     ): RetryDecision {
+        const endpoint = reservation.endpoint;
         if (error instanceof EndpointReservationUnavailableError) {
             return { category: "unknown", error, retry: mode === "retry" };
         }
         if (error instanceof RpcEndpointDataError) {
             recordRpcError(this.#state.counters, endpoint.counters, "endpoint-data");
-            const cooldownUntil = applyEndpointDataCooldown(endpoint, this.#runtime.monotonicNow(), this.#runtime);
-            this.#emitCooldown(endpoint, "endpoint-data", cooldownUntil);
+            if (reservation.version === endpoint.version) {
+                const cooldownUntil = applyEndpointDataCooldown(endpoint, this.#runtime.monotonicNow(), this.#runtime);
+                this.#emitCooldown(endpoint, "endpoint-data", cooldownUntil);
+            }
             return { category: "endpoint-data", error, retry: mode === "retry" };
         }
         if (error instanceof RpcChainIdMismatchError) {
@@ -505,12 +509,12 @@ export class RpcPoolManager {
         if (failure === undefined) {
             return { category: "unknown", error, retry: false };
         }
-        const decision = this.#applyTransportFailure(endpoint, error, failure);
+        const decision = this.#applyTransportFailure(reservation, error, failure);
         return mode === "once" && callbackStarted ? { ...decision, retry: false } : decision;
     }
 
     #applyTransportFailure(
-        endpoint: ManagedEndpoint,
+        reservation: EndpointReservation<ManagedEndpoint>,
         error: unknown,
         classification: RpcErrorClassification,
     ): RetryDecision {
@@ -518,25 +522,33 @@ export class RpcPoolManager {
             return { category: classification.category, error, retry: false };
         }
         if (classification.action === "exclude") {
-            excludeEndpoint(endpoint, "authorization");
-        } else if (classification.category === "rate-limit" || classification.category === "quota-limit") {
-            const cooldownUntil = applyLongCooldown(
-                endpoint,
-                this.#runtime.monotonicNow(),
-                this.#runtime,
-                classification.retryAfterMs ?? null,
-            );
-            this.#emitCooldown(endpoint, classification.category, cooldownUntil);
+            excludeEndpoint(reservation.endpoint, "authorization");
         } else {
-            const cooldownUntil = applyShortCooldown(
-                endpoint,
-                this.#runtime.monotonicNow(),
-                this.#runtime,
-                classification.retryAfterMs ?? null,
-            );
-            this.#emitCooldown(endpoint, classification.category, cooldownUntil);
+            this.#applyTransportCooldown(reservation, classification);
         }
         return { category: classification.category, error, retry: true };
+    }
+
+    #applyTransportCooldown(
+        reservation: EndpointReservation<ManagedEndpoint>,
+        classification: RpcCooldownClassification,
+    ): void {
+        const endpoint = reservation.endpoint;
+        const nowMs = this.#runtime.monotonicNow();
+        const retryAfterMs = classification.retryAfterMs ?? null;
+        let cooldownUntil: number | null;
+        if (reservation.version !== endpoint.version) {
+            cooldownUntil = retryAfterMs === null
+                ? null
+                : extendCooldown(endpoint, nowMs, this.#runtime, retryAfterMs);
+        } else if (classification.category === "rate-limit" || classification.category === "quota-limit") {
+            cooldownUntil = applyLongCooldown(endpoint, nowMs, this.#runtime, retryAfterMs);
+        } else {
+            cooldownUntil = applyShortCooldown(endpoint, nowMs, this.#runtime, retryAfterMs);
+        }
+        if (cooldownUntil !== null) {
+            this.#emitCooldown(endpoint, classification.category, cooldownUntil);
+        }
     }
 
     #emitCooldown(endpoint: ManagedEndpoint, category: RpcErrorCategory, cooldownUntil: number): void {
@@ -648,7 +660,7 @@ export class RpcPoolManager {
             return result;
         } catch (error: unknown) {
             options.signal.throwIfAborted();
-            this.#handleFailure(endpoint, error, sent, "once");
+            this.#handleFailure(reservation, error, sent, "once");
             notifyNetworkStateChanged(network);
             reportFailure({
                 endpointNumber: endpoint.endpointNumber,
