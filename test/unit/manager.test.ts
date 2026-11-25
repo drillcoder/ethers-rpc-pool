@@ -1648,8 +1648,10 @@ describe("RpcPoolManager operation entry points", () => {
     it("leaves shared-provider listeners under consumer control", async () => {
         vi.stubGlobal("fetch", vi.fn((_input: string | URL | Request, init?: RequestInit) =>
             Promise.resolve(rpcResponse(init ?? {}))));
-        const on = vi.spyOn(EndpointJsonRpcProvider.prototype, "on").mockResolvedValue({} as EndpointJsonRpcProvider);
-        const off = vi.spyOn(EndpointJsonRpcProvider.prototype, "off").mockResolvedValue({} as EndpointJsonRpcProvider);
+        const on = vi.spyOn(EndpointJsonRpcProvider.prototype, "on")
+            .mockImplementation(function (this: EndpointJsonRpcProvider) { return Promise.resolve(this); });
+        const off = vi.spyOn(EndpointJsonRpcProvider.prototype, "off")
+            .mockImplementation(function (this: EndpointJsonRpcProvider) { return Promise.resolve(this); });
         const manager = new RpcPoolManager(config);
         const listener = vi.fn();
 
